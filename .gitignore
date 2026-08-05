@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.DS_Store
+# large/transient run artifacts (keep curated results/ committed, ignore scratch)
+results/scratch/
+*.log
+env.sh
+cluster.crt

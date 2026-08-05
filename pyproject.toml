@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra-kv"
+version = "0.1.0"
+description = "SPECTRA: Spectral transform coding with rate allocation — training-free KV cache compression beyond the 2-bit cliff."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.57",
+    "datasets>=2.18,<4",
+    "matplotlib>=3.9",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+eval = ["lm-eval>=0.4"]
+
+[tool.setuptools]
+packages = ["spectra", "spectra.eval"]
