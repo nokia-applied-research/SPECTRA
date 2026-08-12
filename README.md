@@ -4,6 +4,7 @@
 
 **Cache the latent, not the keys and values.**
 
+[![arXiv](https://img.shields.io/badge/arXiv-2608.07915-b31b1b.svg)](https://arxiv.org/abs/2608.07915)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org)
 
@@ -20,7 +21,7 @@ bit allocation — **JPEG for the KV cache** (a Karhunen–Loève transform foll
 allocation on its coefficients). It folds into `k_proj`/`v_proj` (plus a closed-form `o_proj` correction),
 so standard `model.generate()` just works — no fine-tuning.
 
-> Paper: *SPECTRA: Pushing the KV Cache Beyond the 2-Bit Cliff via Spectral Transform Coding* (preprint).
+> Paper: [*SPECTRA: Pushing the KV Cache Beyond the 2-Bit Cliff via Spectral Transform Coding*](https://arxiv.org/abs/2608.07915) — arXiv:2608.07915.
 
 ## Highlights
 
@@ -110,11 +111,14 @@ assets/         headline figures
 ## Citation
 
 ```bibtex
-@article{spectra2026,
-  title   = {SPECTRA: Pushing the KV Cache Beyond the 2-Bit Cliff via Spectral Transform Coding},
-  author  = {Zhang, Jiamu and Wu, Liang and Wan, Kelly and Chen, Hanjie and Hong, Liangjie},
-  journal = {arXiv preprint},
-  year    = {2026}
+@misc{zhang2026spectrapushingkvcache,
+      title={SPECTRA: Pushing the KV Cache Beyond the 2-Bit Cliff via Spectral Transform Coding}, 
+      author={Jiamu Zhang and Liang Wu and Kelly Wan and Hanjie Chen and Liangjie Hong},
+      year={2026},
+      eprint={2608.07915},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2608.07915}, 
 }
 ```
 
