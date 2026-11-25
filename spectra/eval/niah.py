@@ -5,8 +5,8 @@ chat template with a system prompt; greedy decoding of 24 new tokens (32 for sev
 code appears in the output (the fraction of codes found with several needles). Defaults: contexts 1K-32K, depths
 0-100% in 7 steps.
 
-    python -m spectra.eval.niah --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset s12-B --out runs/niah.json
-    python -m spectra.eval.niah --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset s12-B --needles 4 --out runs/niah4.json
+    python -m spectra.eval.niah --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset 11x --out runs/niah.json
+    python -m spectra.eval.niah --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset 11x --needles 4 --out runs/niah4.json
 """
 from __future__ import annotations
 import argparse, json, os, time
@@ -68,7 +68,7 @@ def run_niah(gen_fn, tok, dev, contexts, depths, magic="7429183", gen_tokens=24,
 def main():
     ap = argparse.ArgumentParser(description="Needle-in-a-haystack grid for the dense model or a SPECTRA preset.")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--preset", default="", help="SPECTRA preset (e.g. s12-B); empty = dense")
+    ap.add_argument("--preset", default="", help="SPECTRA preset (e.g. 11x, see docs/presets.md); empty = dense")
     ap.add_argument("--calib", default="wikitext+code", choices=["wikitext+code", "wikitext"])
     ap.add_argument("--contexts", default="1024,2048,4096,8192,16384,32768")
     ap.add_argument("--depths", default="0,17,33,50,67,83,100")

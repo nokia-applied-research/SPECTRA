@@ -5,7 +5,7 @@ import torch
 from spectra.accounting import honest_ratio, accounting_block
 from spectra.method import fake_quant, LatentProjV2, cache_frac, _apply_exact_window
 from spectra.quant import water_filling_bits
-from spectra.api import PRESETS, ALIASES, parse_preset, _default_args
+from spectra.api import PRESETS, NAMED, ALIASES, parse_preset, _default_args
 
 ok = True
 def check(name, cond):
@@ -51,7 +51,8 @@ o1 = mod(h[:, :1]); mod.sink = mod.recent = 0; q1 = mod(h[:, :1])
 check("window: decode token quantized", torch.equal(o1, q1) and not torch.allclose(o1, ex[:, :1]))
 
 # presets
-check("aliases resolve", all(parse_preset(a)[0] == ALIASES[a] for a in ALIASES))
+check("v0.1 names resolve", all(parse_preset(a)[0] == ALIASES[a] for a in ALIASES))
+check("ratio names resolve", all(parse_preset(n)[0] + ("-B" if parse_preset(n)[2] else "") == c for n, c in NAMED.items()))
 check("-B suffix turns the window on", parse_preset("s12-B")[2] and not parse_preset("s12")[2])
 check("all presets complete", all({"mode", "bits", "kv_ratio", "group"} <= set(c) for c in PRESETS.values()))
 

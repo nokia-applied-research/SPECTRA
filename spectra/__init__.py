@@ -5,7 +5,7 @@ SVD of k_proj / v_proj), bits are allocated across the latent by reverse water-f
 closed form. No fine-tuning.
 
     import spectra
-    model, tok = spectra.compress("NousResearch/Meta-Llama-3.1-8B-Instruct", preset="s95-B")
+    model, tok = spectra.compress("NousResearch/Meta-Llama-3.1-8B-Instruct", preset="8.8x")
     spectra.save(model, "out_dir"); model, tok = spectra.load("out_dir")
 
 Lower-level pieces:

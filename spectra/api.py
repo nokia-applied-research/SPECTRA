@@ -1,13 +1,14 @@
 """SPECTRA easy API: compress an HF model's KV cache in one call, then save / load / generate.
 
     import spectra
-    model, tok = spectra.compress("NousResearch/Meta-Llama-3.1-8B-Instruct", preset="s95-B")
-    spectra.save(model, "spectra_l31_s95B")          # small delta: factors + healed o_proj
-    model, tok = spectra.load("spectra_l31_s95B")    # rebuilds from the HF base + delta
+    model, tok = spectra.compress("NousResearch/Meta-Llama-3.1-8B-Instruct", preset="8.8x")
+    spectra.save(model, "spectra_l31_8.8x")          # small delta: factors + healed o_proj
+    model, tok = spectra.load("spectra_l31_8.8x")    # rebuilds from the HF base + delta
 
-`preset` names one of the paper's operating points (PRESETS); a `-B` suffix keeps the first 4 and the last 64
-prompt tokens of K and V exact. Override with `B=` and `bits=` for a custom point. Compression replaces
-k_proj / v_proj with latent projections and heals o_proj in closed form; no training, and `model.generate` works.
+`preset` is one of the paper's operating points, named by its KV compression on Llama-3.1-8B (NAMED), or an
+internal config name (PRESETS; a `-B` suffix keeps the first 4 and the last 64 prompt tokens of K and V exact).
+See docs/presets.md. Override with `B=` and `bits=` for a custom point. Compression replaces k_proj / v_proj with
+latent projections and heals o_proj in closed form; no training, and `model.generate` works.
 """
 from __future__ import annotations
 import json, os, time
@@ -20,7 +21,8 @@ from .accounting import honest_ratio
 
 # The paper's operating points. B is the latent width summed over K and V (capped per side at the KV width of the
 # model), bits the average bits per latent value. mode "wf" = water-filling bit allocation over the energy-ordered
-# latent; "lowrank" = rank truncation with uniform bits, the top `heavy_k` channels at 8 bits, optional Hadamard.
+# latent; "lowrank" = rank truncation with uniform bits, the top `heavy_k` channels at 8 bits, and optionally a
+# random orthogonal rotation of the rest (`hadamard`, the historical name).
 # The same preset gives different ratios on different models; the README lists the measured ones.
 PRESETS = {
     "s35":   dict(mode="wf",      B=2048, bits=4, kv_ratio=0.5,  group=64,  heavy_k=0,  hadamard=False, center=True),
@@ -43,8 +45,11 @@ PRESETS = {
     # scales with the model (b_frac of the fp16 KV width)
     "vllm-7x": dict(mode="lowrank", b_frac=0.5, bits=4, kv_ratio=0.5, group=64, heavy_k=0, hadamard=False, center=False),
 }
-# v0.1 names. Identical to the paper presets on 8-KV-head models (Llama-3.1-8B, Mistral-7B).
-ALIASES = {"3x": "s35", "5x": "s45", "6x": "s65", "9x": "s95", "12x": "s12"}
+# Public names: the KV compression each paper point reaches on Llama-3.1-8B (LongBench, exact window counted).
+NAMED = {"3.6x": "s35", "4x": "t40b-B", "4.6x": "s45", "5.5x": "L48-B", "5.8x": "L55-B", "6x": "L65-B",
+         "6.7x": "L70-B", "7.7x": "t80e-B", "8.8x": "s95-B", "11x": "s12-B"}
+# v0.1 names (no exact window), kept for compatibility.
+ALIASES = {"3x": "s35", "5x": "s45", "9x": "s95", "12x": "s12"}
 SINK, RECENT = 4, 64                       # the `-B` exact window: 68 tokens of K and V kept in fp16
 CALIB_RECIPES = ("wikitext+code", "wikitext")
 
@@ -64,13 +69,14 @@ def _resolve_device(device):
 
 
 def parse_preset(name):
-    """'s12-B' -> ('s12', config dict, window on). Accepts the v0.1 aliases ('9x', ...)."""
+    """'11x' or 's12-B' -> ('s12', config dict, window on). Also accepts the v0.1 names ('9x', ...)."""
+    name = NAMED.get(name, name)
     window = name.endswith("-B")
     base = name[:-2] if window else name
     base = ALIASES.get(base, base)
     if base not in PRESETS:
-        raise ValueError(f"unknown preset '{name}'; choose one of {list(PRESETS)} (optionally with -B) "
-                         f"or {list(ALIASES)}, or pass B= and bits=")
+        raise ValueError(f"unknown preset '{name}'; choose one of {list(NAMED)} (see docs/presets.md), "
+                         f"or pass B= and bits=")
     return base, dict(PRESETS[base]), window
 
 
@@ -98,12 +104,12 @@ def make_calib_windows(tok, recipe="wikitext+code", n=16, seq_len=2048, text=Non
 
 
 @torch.no_grad()
-def compress(model, tokenizer=None, preset="s95-B", *, ratio=None, B=None, bits=None, window=None,
+def compress(model, tokenizer=None, preset="8.8x", *, ratio=None, B=None, bits=None, window=None,
              calib="wikitext+code", calib_windows=16, calib_text=None, seq_len=2048,
              device=None, dtype=torch.float16, verbose=True):
     """Compress `model` (an HF model or a model id) in place. Returns (model, tok).
 
-    preset : a PRESETS name, optionally with `-B` (exact window). `ratio=` is the v0.1 name of this argument.
+    preset : a NAMED preset ('3.6x' ... '11x') or a PRESETS name. `ratio=` is the v0.1 name of this argument.
     B, bits: a custom operating point (latent width, average bits) instead of a preset.
     window : keep the first 4 and last 64 prompt tokens exact (default: on for `-B` presets).
     calib  : 'wikitext+code' (the paper's recipe, 8 + 8 windows of 2048 tokens) or 'wikitext'.
@@ -137,7 +143,8 @@ def compress(model, tokenizer=None, preset="s95-B", *, ratio=None, B=None, bits=
     eff_B = cfg["B"] if "B" in cfg else max(1, int(round(cfg["b_frac"] * 2 * heads.kv_dim)))
     args = _default_args(water_filling=(cfg["mode"] == "wf"), kv_ratio=cfg["kv_ratio"], center=cfg["center"],
                          group=cfg["group"], heavy_k=cfg["heavy_k"], heavy_bits=8, hadamard=cfg["hadamard"])
-    label = base + ("-B" if keep else "")
+    config = base + ("-B" if keep else "")
+    label = name if (name in NAMED and NAMED[name] == config) else config
     if verbose:
         print(f"[spectra] {model_id}  arch={heads.arch} L={heads.L} kv_dim={heads.kv_dim}", flush=True)
         print(f"[spectra] preset={label} mode={cfg['mode']} B={eff_B} bits={cfg['bits']} calib={calib}", flush=True)
@@ -157,7 +164,7 @@ def compress(model, tokenizer=None, preset="s95-B", *, ratio=None, B=None, bits=
     if keep:
         set_exact_window(heads, WKo, WVo, kb, vb, SINK, RECENT)
     comp = round(1.0 / cf, 2)
-    model._spectra = dict(base_model=model_id, preset=label, mode=cfg["mode"], B=eff_B, bits=cfg["bits"],
+    model._spectra = dict(base_model=model_id, preset=label, config=config, mode=cfg["mode"], B=eff_B, bits=cfg["bits"],
                           r_k=r_k, r_v=r_v, cache_frac=cf, compression=comp, group=args.group,
                           window=[SINK, RECENT] if keep else None, calib=calib, calib_windows=len(cw))
     if verbose:
@@ -259,7 +266,7 @@ def _main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("compress", help="compress an HF model and save a SPECTRA delta")
     c.add_argument("--model", required=True)
-    c.add_argument("--preset", default="s95-B", help=f"one of {list(PRESETS)}, optionally with -B")
+    c.add_argument("--preset", default="8.8x", help=f"one of {list(NAMED)} (see docs/presets.md)")
     c.add_argument("--bits", type=int, default=None)
     c.add_argument("--B", type=int, default=None)
     c.add_argument("--calib", default="wikitext+code", choices=CALIB_RECIPES)

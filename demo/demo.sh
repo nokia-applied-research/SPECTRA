@@ -2,13 +2,13 @@
 # One-click SPECTRA demo (single GPU). Shows: (1) compress + generate + near-lossless perplexity,
 # (2) real memory / max-batch efficiency vs fp16.
 #
-#   bash demo/demo.sh                       # default model NousResearch/Meta-Llama-3.1-8B-Instruct, preset s95-B
-#   MODEL=Qwen/Qwen2.5-7B-Instruct PRESET=s45-B bash demo/demo.sh
+#   bash demo/demo.sh                       # default model NousResearch/Meta-Llama-3.1-8B-Instruct, preset 8.8x
+#   MODEL=Qwen/Qwen2.5-7B-Instruct PRESET=4.6x bash demo/demo.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL="${MODEL:-NousResearch/Meta-Llama-3.1-8B-Instruct}"
-PRESET="${PRESET:-s95-B}"
+PRESET="${PRESET:-8.8x}"
 PYTHON="${PYTHON:-$(command -v python || command -v python3)}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"   # silence long-context tokenizer warnings

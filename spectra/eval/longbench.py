@@ -10,7 +10,7 @@ The full test split of every task is used by default. Generation is batched (lef
 most 16 prompts or 64K tokens per batch), as in the paper's runs.
 
     python -m spectra.eval.longbench --model NousResearch/Meta-Llama-3.1-8B-Instruct --out runs/dense.json
-    python -m spectra.eval.longbench --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset s95-B --out runs/s95B.json
+    python -m spectra.eval.longbench --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset 8.8x --out runs/8.8x.json
 
 The output records the score and the number of samples per task, the context length of every sample, and for
 SPECTRA the compression ratio over those samples (window counted, see spectra.accounting).
@@ -125,7 +125,7 @@ def run_longbench(model, tok, dev, tasks, max_samples=None, max_len=31500, use_c
 def main():
     ap = argparse.ArgumentParser(description="LongBench-8 with the official prompts and scorer, full test split.")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--preset", default="", help="SPECTRA preset (e.g. s95-B); empty = dense")
+    ap.add_argument("--preset", default="", help="SPECTRA preset (e.g. 8.8x, see docs/presets.md); empty = dense")
     ap.add_argument("--calib", default="wikitext+code", choices=["wikitext+code", "wikitext"])
     ap.add_argument("--tasks", default=TASKS)
     ap.add_argument("--max-samples", type=int, default=None, help="cap per task (default: full test split)")
