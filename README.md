@@ -288,7 +288,7 @@ scores, every preset, the baseline settings and all NIAH rows are in [docs/resul
 ```bash
 M=NousResearch/Meta-Llama-3.1-8B-Instruct
 
-# LongBench-8, full test split (about 1 h per run on one GPU)
+# LongBench-8, full test split (about 1 h 10 min per run on one H100)
 python scripts/run_longbench.py --model $M --out runs/dense.json                # 53.29
 python scripts/run_longbench.py --model $M --preset 11x --out runs/11x.json     # 52.44, 11.09x
 
@@ -296,6 +296,11 @@ python scripts/run_longbench.py --model $M --preset 11x --out runs/11x.json     
 python scripts/run_niah.py --model $M --preset 11x --out runs/niah.json                 # 100
 python scripts/run_niah.py --model $M --preset 11x --needles 4 --out runs/niah4.json    # 100
 ```
+
+The numbers in the comments are the paper's. A rerun of this code on another machine (H100 NVL, torch 2.8,
+transformers 4.57) gave dense 53.79, `11x` 52.52 and `8.8x` 52.94 at the same ratios (11.09× and 8.82×). Single tasks
+moved by up to 3 points either way, mostly on Qasper and the two code tasks; the averages stay within about half a
+point.
 
 ---
 
