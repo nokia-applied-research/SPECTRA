@@ -1,12 +1,13 @@
-# SPECTRA dependencies.
-# Tested (bit-for-bit reproducible) stack on H100 / CUDA 12-13:
-#   torch 2.11.0, transformers 5.11.0, datasets 3.6.0, numpy 2.2.6, triton 3.x
-# Ranges below are the supported window; pin to the tested versions for exact reproduction.
+# SPECTRA dependencies. Tested stack (H100, CUDA 12-13): torch 2.11, transformers 5.11, datasets 3.6, numpy 2.2.
 torch>=2.5
 transformers>=4.57,<6        # needs the `dtype=` from_pretrained kwarg (>=4.56)
-datasets>=2.18,<4            # v4+ removed the script loader THUDM/LongBench requires
+datasets>=2.18,<4            # v4 removed the script loader that THUDM/LongBench needs
 numpy>=1.26
-matplotlib>=3.9             # figures (energy / bitprofile / NIAH)
+# LongBench evaluation (official metrics):
+rouge
+fuzzywuzzy
+jieba
 # optional:
-# lm-eval>=0.4              # zero-shot accuracy (run_ppl_lmeval.py --lm-eval)
-# triton>=3.0              # Mode-B latent-attention decode kernel (Hopper)
+# lm-eval>=0.4               # zero-shot accuracy in `python -m spectra.method --lm-eval`
+# matplotlib>=3.9            # scripts/tools figures
+# triton>=3.0                # scripts/tools/bench_kernel.py

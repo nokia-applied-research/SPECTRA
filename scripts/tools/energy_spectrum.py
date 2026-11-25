@@ -14,7 +14,7 @@ The gap between the two curves is exactly "why G-weighting matters" (and preview
 
 Usage:
   python scripts/tools/energy_spectrum.py --model NousResearch/Meta-Llama-3.1-8B-Instruct \
-      --calib-windows 24 --seq-len 2048 --out results/arxiv_v1/figs/energy_l31
+      --calib-windows 24 --seq-len 2048 --out runs/energy_l31
 """
 import os, sys, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -51,7 +51,7 @@ def main():
     ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--calib-windows", type=int, default=24)
     ap.add_argument("--ridge", type=float, default=1e-3)
-    ap.add_argument("--out", default="results/arxiv_v1/figs/energy")
+    ap.add_argument("--out", default="runs/energy")
     args = ap.parse_args()
 
     dev = args.device

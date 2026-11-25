@@ -4,20 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spectra-kv"
-version = "0.1.0"
-description = "SPECTRA: Spectral transform coding with rate allocation — training-free KV cache compression beyond the 2-bit cliff."
+version = "0.2.0"
+description = "SPECTRA: training-free KV-cache compression by spectral transform coding."
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.5",
-    "transformers>=4.57",
+    "transformers>=4.57,<6",
     "datasets>=2.18,<4",
-    "matplotlib>=3.9",
     "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
-eval = ["lm-eval>=0.4"]
+eval = ["rouge", "fuzzywuzzy", "jieba"]          # LongBench metrics (official metrics.py)
+ppl = ["lm-eval>=0.4"]
+tools = ["matplotlib>=3.9"]
 
 [tool.setuptools]
 packages = ["spectra", "spectra.eval"]
+
+[tool.setuptools.package-data]
+"spectra.eval" = ["config/*.json"]

@@ -1,7 +1,8 @@
 """SPECTRA self-contained HF model: latent-KV Llama with a REAL packed-int4 latent KV cache.
 AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=True) loads it; model.generate() runs Mode A
 (store packed int4 latent -> reconstruct K,V + exact RoPE -> attend), so KV memory is at the compression
-rate (~7-8x), not fp16. k_proj/v_proj are low-rank down-projections (W_DOWN); o_proj is closed-form healed."""
+rate (~7-8x), not fp16; decode is slower than dense because K and V are rebuilt at every step.
+k_proj/v_proj are low-rank down-projections (W_DOWN); o_proj is closed-form healed."""
 import torch, torch.nn as nn, types, math
 import torch.nn.functional as F
 from transformers import LlamaForCausalLM

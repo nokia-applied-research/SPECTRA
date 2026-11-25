@@ -1,273 +1,171 @@
-"""longbench.py — LongBench evaluation harness (the field-standard long-context benchmark).
+"""LongBench (8 English tasks), the protocol behind the paper's tables.
 
-Implements the KIVI/GEAR subset (8 English tasks spanning single-doc QA, summarization,
-few-shot, code) with the official LongBench prompt templates, generation lengths, and metrics
-(token-F1 / ROUGE-L / classification / code edit-similarity). Method application (base / SPECTRA
-configs / quant+evict baselines) reuses the exact same plumbing as ruler.py.
+Prompting and scoring follow the official THUDM/LongBench harness:
+  * prompts and max new tokens: config/dataset2prompt.json and config/dataset2maxlen.json (verbatim);
+  * prompts longer than --max-length are truncated in the middle, before the chat template;
+  * the model's chat template is applied except on trec, triviaqa, samsum, lcc and repobench-p;
+  * greedy decoding; samsum also stops at a newline;
+  * scores: metrics.py (verbatim) with the official first-line post-processing for trec / triviaqa / samsum.
+The full test split of every task is used by default. Generation is batched (left-padded, sorted by length, at
+most 16 prompts or 64K tokens per batch), as in the paper's runs.
 
-Tasks: qasper, qmsum, multi_news, trec, triviaqa, samsum, lcc, repobench-p.
-Dataset: THUDM/LongBench (one config per task). Middle-truncate prompts to --max-len.
+    python -m spectra.eval.longbench --model NousResearch/Meta-Llama-3.1-8B-Instruct --out runs/dense.json
+    python -m spectra.eval.longbench --model NousResearch/Meta-Llama-3.1-8B-Instruct --preset s95-B --out runs/s95B.json
+
+The output records the score and the number of samples per task, the context length of every sample, and for
+SPECTRA the compression ratio over those samples (window counted, see spectra.accounting).
 """
 from __future__ import annotations
-import argparse, json, re, string, time
-from collections import Counter
-import difflib
+import argparse, json, os, time
+
+import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from ..core import AttnHeads, collect_grams_and_mean, make_windows
-from .. import baselines as kvb
-from ..method import build_spectra as build_akvc
 
-QUANT = {"kivi", "turboquant", "polarquant", "quarot"}
+from .metrics import (qa_f1_score, rouge_score, classification_score, retrieval_score, count_score,
+                      code_sim_score)
 
-# ---- official LongBench prompt templates (English subset) ----
-PROMPT = {
-    "qasper": ("You are given a scientific article and a question. Answer the question as concisely "
-               "as you can, using a single phrase or sentence if possible. If the question cannot be "
-               "answered based on the information in the article, write \"unanswerable\".\n\n"
-               "Article: {context}\n\n Answer the question based on the above article as concisely as "
-               "you can, using a single phrase or sentence if possible.\n\nQuestion: {input}\n\nAnswer:"),
-    "qmsum": ("You are given a meeting transcript and a query. Answer the query in one or more "
-              "sentences.\n\nTranscript:\n{context}\n\nNow, answer the query based on the above "
-              "meeting transcript in one or more sentences.\n\nQuery: {input}\nAnswer:"),
-    "multi_news": ("You are given several news passages. Write a one-page summary of all news.\n\n"
-                   "News:\n{context}\n\nNow, write a one-page summary of all the news.\n\nSummary:"),
-    "trec": ("Please determine the type of the question below. Here are some examples of questions.\n\n"
-             "{context}\n{input}"),
-    "triviaqa": ("Answer the question based on the given passage. Only give me the answer and do not "
-                 "output any other words. The following are some examples.\n\n{context}\n\n{input}"),
-    "samsum": ("Summarize the dialogue into a few short sentences. The following are some examples.\n\n"
-               "{context}\n\n{input}"),
-    "lcc": "Please complete the code given below. \n{context}Next line of code:\n",
-    "repobench-p": "Please complete the code given below. \n{context}{input}Next line of code:\n",
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DATASET2PROMPT = json.load(open(os.path.join(_HERE, "config", "dataset2prompt.json")))
+DATASET2MAXLEN = json.load(open(os.path.join(_HERE, "config", "dataset2maxlen.json")))
+DATASET2METRIC = {
+    "narrativeqa": qa_f1_score, "qasper": qa_f1_score, "multifieldqa_en": qa_f1_score,
+    "hotpotqa": qa_f1_score, "2wikimqa": qa_f1_score, "musique": qa_f1_score,
+    "gov_report": rouge_score, "qmsum": rouge_score, "multi_news": rouge_score,
+    "trec": classification_score, "triviaqa": qa_f1_score, "samsum": rouge_score,
+    "passage_retrieval_en": retrieval_score, "passage_count": count_score,
+    "lcc": code_sim_score, "repobench-p": code_sim_score,
 }
-MAXGEN = {"qasper": 128, "qmsum": 512, "multi_news": 512, "trec": 64,
-          "triviaqa": 32, "samsum": 128, "lcc": 64, "repobench-p": 64}
-METRIC = {"qasper": "qa_f1", "qmsum": "rouge", "multi_news": "rouge", "trec": "class",
-          "triviaqa": "qa_f1", "samsum": "rouge", "lcc": "code", "repobench-p": "code"}
+NO_CHAT_TASKS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+TASKS = "qasper,qmsum,multi_news,trec,triviaqa,samsum,lcc,repobench-p"
 
 
-# ----------------------------- metrics (official-style) -----------------------------
-def _norm(s):
-    s = s.lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
+def build_chat(tok, prompt):
+    return tok.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
 
 
-def qa_f1(pred, refs):
-    best = 0.0
-    pt = _norm(pred).split()
-    for r in refs:
-        gt = _norm(r).split()
-        common = Counter(pt) & Counter(gt)
-        ns = sum(common.values())
-        if ns == 0 or not pt or not gt:
-            best = max(best, 0.0); continue
-        prec = ns / len(pt); rec = ns / len(gt)
-        best = max(best, 2 * prec * rec / (prec + rec))
-    return best
+def scorer(dataset, predictions, answers, all_classes):
+    """Official LongBench eval.py scorer."""
+    total = 0.
+    for prediction, ground_truths in zip(predictions, answers):
+        score = 0.
+        if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
+            prediction = prediction.lstrip('\n').split('\n')[0]
+        for ground_truth in ground_truths:
+            score = max(score, DATASET2METRIC[dataset](prediction, ground_truth, all_classes=all_classes))
+        total += score
+    return round(100 * total / len(predictions), 2)
 
 
-def _lcs(a, b):
-    n, m = len(a), len(b)
-    dp = [0] * (m + 1)
-    for i in range(1, n + 1):
-        prev = 0
-        for j in range(1, m + 1):
-            tmp = dp[j]
-            dp[j] = prev + 1 if a[i-1] == b[j-1] else max(dp[j], dp[j-1])
-            prev = tmp
-    return dp[m]
-
-
-def rouge_l(pred, refs):
-    best = 0.0
-    p = _norm(pred).split()
-    for r in refs:
-        g = _norm(r).split()
-        if not p or not g:
-            continue
-        l = _lcs(p, g)
-        if l == 0:
-            continue
-        prec = l / len(p); rec = l / len(g)
-        best = max(best, 2 * prec * rec / (prec + rec))
-    return best
-
-
-def class_score(pred, refs, all_classes):
-    p = pred.strip().lower()
-    em = 0.0
-    for r in refs:
-        rl = r.strip().lower()
-        # the predicted class is the ground-truth iff it appears and no other class "covers" it more
-        if rl in p:
-            em = 1.0
-    return em
-
-
-def code_sim(pred, refs):
-    pl = pred.lstrip("\n").split("\n")
-    pred1 = pl[0] if pl else ""
-    best = 0.0
-    for r in refs:
-        best = max(best, difflib.SequenceMatcher(None, pred1, r).ratio())
-    return best
-
-
-def score_one(task, pred, refs, all_classes):
-    m = METRIC[task]
-    if m == "qa_f1":
-        return qa_f1(pred, refs)
-    if m == "rouge":
-        return rouge_l(pred, refs)
-    if m == "class":
-        return class_score(pred, refs, all_classes)
-    if m == "code":
-        return code_sim(pred, refs)
-    return 0.0
-
-
-# ----------------------------- prompt build + truncation -----------------------------
-def make_input(tok, task, ex, max_len, dev):
-    text = PROMPT[task].format(context=ex.get("context", ""), input=ex.get("input", ""))
-    if getattr(tok, "chat_template", None):
-        ids = tok.apply_chat_template([{"role": "user", "content": text}],
-                                      add_generation_prompt=True, return_tensors="pt",
-                                      return_dict=False)
-    else:
-        ids = tok(text, return_tensors="pt", add_special_tokens=True).input_ids
-    ids = ids[0]
-    if ids.shape[0] > max_len:                       # middle truncation (LongBench convention)
-        h = max_len // 2
-        ids = torch.cat([ids[:h], ids[-(max_len - h):]])
-    return ids.unsqueeze(0).to(dev)
+def encode(tok, task, ex, max_len, use_chat=True):
+    prompt = DATASET2PROMPT[task].format(**ex)
+    ids = tok(prompt, truncation=False, return_tensors="pt").input_ids[0]
+    if len(ids) > max_len:
+        half = max_len // 2
+        prompt = (tok.decode(ids[:half], skip_special_tokens=True)
+                  + tok.decode(ids[-half:], skip_special_tokens=True))
+    if use_chat and task not in NO_CHAT_TASKS:
+        return tok(build_chat(tok, prompt), truncation=False, return_tensors="pt",
+                   add_special_tokens=False).input_ids[0]
+    return tok(prompt, truncation=False, return_tensors="pt", add_special_tokens=True).input_ids[0]
 
 
 @torch.no_grad()
+def generate_batched(model, tok, prompts, max_new, dev, samsum=False, budget=64000, max_bs=16):
+    """Greedy generation in left-padded batches of similar length. Returns the decoded outputs in input order."""
+    order = sorted(range(len(prompts)), key=lambda i: prompts[i].shape[0])
+    out = [None] * len(prompts)
+    eos = tok.eos_token_id
+    eos_ids = [eos]
+    if samsum:
+        nl = tok.encode("\n", add_special_tokens=False)
+        if nl:
+            eos_ids = [eos, nl[-1]]
+    i = 0
+    while i < len(order):
+        maxlen = prompts[order[i]].shape[0]; j = i
+        while j < len(order):
+            cand = max(maxlen, prompts[order[j]].shape[0])
+            if (j - i + 1) > max_bs or (j - i + 1) * cand > budget:
+                break
+            maxlen = cand; j += 1
+        idxs = order[i:j]; chunk = [prompts[k] for k in idxs]
+        ml = max(x.shape[0] for x in chunk)
+        ids = torch.full((len(chunk), ml), tok.pad_token_id, dtype=torch.long)
+        am = torch.zeros((len(chunk), ml), dtype=torch.long)
+        for t, x in enumerate(chunk):
+            ids[t, ml - x.shape[0]:] = x; am[t, ml - x.shape[0]:] = 1
+        o = model.generate(input_ids=ids.to(dev), attention_mask=am.to(dev), max_new_tokens=max_new,
+                           do_sample=False, num_beams=1, pad_token_id=eos, eos_token_id=eos_ids)
+        for t, k in enumerate(idxs):
+            out[k] = tok.decode(o[t, ml:], skip_special_tokens=True)
+        i = j
+    return out
+
+
+def run_longbench(model, tok, dev, tasks, max_samples=None, max_len=31500, use_chat=True, log=print):
+    """Returns {task: score, 'overall': mean, '_n': {task: n}, '_len': {task: [context lengths]}}."""
+    from datasets import load_dataset
+    scores, n, lens = {}, {}, {}
+    for task in tasks:
+        ds = load_dataset("THUDM/LongBench", task, split="test", trust_remote_code=True)
+        data = list(ds if max_samples is None else ds.select(range(min(max_samples, len(ds)))))
+        prompts = [encode(tok, task, ex, max_len, use_chat).to(dev) for ex in data]
+        outs = generate_batched(model, tok, prompts, DATASET2MAXLEN[task], dev, samsum=(task == "samsum"))
+        all_classes = data[0].get("all_classes", []) if data else []
+        scores[task] = scorer(task, outs, [ex["answers"] for ex in data], all_classes)
+        n[task] = len(outs)
+        lens[task] = [int(p.shape[-1]) for p in prompts]
+        log(f"[longbench] {task}: {scores[task]}  (n={n[task]})")
+    scores["overall"] = round(float(np.mean([scores[t] for t in tasks])), 2)
+    log(f"[longbench] overall: {scores['overall']}")
+    scores["_n"], scores["_len"] = n, lens
+    return scores
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="LongBench-8 with the official prompts and scorer, full test split.")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--device", default="cuda:0"); ap.add_argument("--dtype", default="float16")
-    ap.add_argument("--tasks", default="qasper,qmsum,multi_news,trec,triviaqa,samsum,lcc,repobench-p")
-    ap.add_argument("--max-samples", type=int, default=150)
-    ap.add_argument("--max-len", type=int, default=31500)
-    # methods (same surface as ruler)
-    ap.add_argument("--configs", default=""); ap.add_argument("--baselines", default="")
-    ap.add_argument("--kv-ratio", type=float, default=0.25); ap.add_argument("--wo-rank", type=int, default=4)
-    ap.add_argument("--mla-ridge", type=float, default=1e-3); ap.add_argument("--wo-ridge", type=float, default=1e-2)
-    ap.add_argument("--group", type=int, default=64); ap.add_argument("--center", action="store_true")
-    ap.add_argument("--heavy-k", type=int, default=0); ap.add_argument("--heavy-bits", type=int, default=8)
-    ap.add_argument("--hadamard", action="store_true"); ap.add_argument("--plain-svd", action="store_true")
-    ap.add_argument("--water-filling", action="store_true")
-    ap.add_argument("--wf-bmax", type=int, default=8); ap.add_argument("--wf-clip", type=float, default=4.0)
-    ap.add_argument("--wf-residual", type=int, default=0)
-    ap.add_argument("--gk", type=int, default=128); ap.add_argument("--gv", type=int, default=32)
-    ap.add_argument("--residual", type=int, default=128)
-    ap.add_argument("--calib-windows", type=int, default=32); ap.add_argument("--seq-len", type=int, default=2048)
-    ap.add_argument("--skip-base", action="store_true", help="skip base (fp16) pass; use when base is already computed")
+    ap.add_argument("--preset", default="", help="SPECTRA preset (e.g. s95-B); empty = dense")
+    ap.add_argument("--calib", default="wikitext+code", choices=["wikitext+code", "wikitext"])
+    ap.add_argument("--tasks", default=TASKS)
+    ap.add_argument("--max-samples", type=int, default=None, help="cap per task (default: full test split)")
+    ap.add_argument("--max-length", type=int, default=31500)
+    ap.add_argument("--no-chat", action="store_true")
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    torch.set_grad_enabled(False)
-    dev = args.device; dtype = getattr(torch, args.dtype)
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from ..accounting import accounting_block
+    dev, dtype = args.device, getattr(torch, args.dtype)
     tasks = [t for t in args.tasks.split(",") if t.strip()]
-    print(f"[load] {args.model}", flush=True)
-    tok = AutoTokenizer.from_pretrained(args.model)
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(dev).eval()
-    heads = AttnHeads(model)
-    print(f"[cfg] arch={heads.arch} L={heads.L} kv_dim={heads.kv_dim}", flush=True)
+    t0 = time.time()
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, trust_remote_code=True,
+                                                 low_cpu_mem_usage=True, device_map=dev).eval()
+    rec = {"model": args.model, "preset": args.preset or "dense", "max_samples": args.max_samples,
+           "max_length": args.max_length}
+    if args.preset:
+        from ..api import compress
+        model, tok = compress(model, tok, preset=args.preset, calib=args.calib, device=dev, dtype=dtype)
+        rec.update(calib=args.calib, latent_ratio=model._spectra["compression"], window=model._spectra["window"])
 
-    from datasets import load_dataset
-    data = {}
-    for t in tasks:
-        ds = load_dataset("THUDM/LongBench", t, split="test", trust_remote_code=True)
-        data[t] = list(ds.select(range(min(args.max_samples, len(ds)))))
-        print(f"[data] {t}: {len(data[t])}", flush=True)
-
-    def run_method(gen_fn, label):
-        res = {}
-        for t in tasks:
-            sc = []
-            for ex in data[t]:
-                ids = make_input(tok, t, ex, args.max_len, dev)
-                txt = gen_fn(ids, MAXGEN[t])
-                sc.append(score_one(t, txt, ex.get("answers", []), ex.get("all_classes", [])))
-            res[t] = round(100 * sum(sc) / max(1, len(sc)), 2)
-            print(f"[{label}] {t}: {res[t]}", flush=True)
-        res["overall"] = round(sum(res[t] for t in tasks) / len(tasks), 2)
-        return res
-
-    results = {}
-
-    def base_gen(ids, mg):
-        o = model.generate(ids, max_new_tokens=mg, do_sample=False, pad_token_id=tok.eos_token_id, use_cache=True)
-        return tok.decode(o[0, ids.shape[1]:], skip_special_tokens=True)
-    if not args.skip_base:
-        results["base"] = {"acc": run_method(base_gen, "base"), "total_x": 1.0}
-
-    # SPECTRA configs
-    cfgs = [s for s in args.configs.split(",") if s.strip()]
-    if cfgs:
-        hay = "\n\n".join(t for t in load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")["text"] if t.strip())
-        WKo = [l.self_attn.k_proj.weight.detach().clone() for l in heads.layers]
-        WVo = [l.self_attn.v_proj.weight.detach().clone() for l in heads.layers]
-        WOo = [l.self_attn.o_proj.weight.detach().clone() for l in heads.layers]
-        kb = [(l.self_attn.k_proj.bias.detach().clone() if l.self_attn.k_proj.bias is not None else None) for l in heads.layers]
-        vb = [(l.self_attn.v_proj.bias.detach().clone() if l.self_attn.v_proj.bias is not None else None) for l in heads.layers]
-        ok_ = [l.self_attn.k_proj for l in heads.layers]; ov_ = [l.self_attn.v_proj for l in heads.layers]
-
-        def restore():
-            for l in range(heads.L):
-                heads.layers[l].self_attn.k_proj = ok_[l]; heads.layers[l].self_attn.v_proj = ov_[l]
-                ok_[l].weight.copy_(WKo[l]); ov_[l].weight.copy_(WVo[l])
-                heads.layers[l].self_attn.o_proj.weight.copy_(WOo[l])
-
-        G, hmean = collect_grams_and_mean(model, heads, make_windows(tok, hay, args.seq_len, args.calib_windows), dev)
-        if args.plain_svd:
-            G = [torch.eye(heads.d, device=dev, dtype=G[l].dtype) for l in range(heads.L)]
-        for spec in cfgs:
-            B, bits = (int(x) for x in spec.split(":")); restore()
-            cw = make_windows(tok, hay, args.seq_len, args.calib_windows)
-            r_k, r_v, cf = build_akvc(model, heads, G, hmean, WKo, WVo, WOo, kb, vb, cw, dev, dtype, B, bits, args)
-            results[f"akvc_B{B}_b{bits}"] = {"acc": run_method(base_gen, f"akvc_B{B}_b{bits}"),
-                                             "total_x": round(1 / cf, 2)}
-        restore()
-
-    # quant / evict baselines
-    for spec in [s for s in args.baselines.split(",") if s.strip()]:
-        method, param = spec.split(":"); param = int(param)
-        if method in QUANT:
-            _, eb = kvb.make_quant_cache(method, heads.hd, param, dev, gk=args.gk, gv=args.gv, residual=args.residual)
-
-            def gen_fn(ids, mg, _m=method, _p=param):
-                c, _ = kvb.make_quant_cache(_m, heads.hd, _p, dev, gk=args.gk, gv=args.gv, residual=args.residual)
-                o = model.generate(ids, max_new_tokens=mg, do_sample=False, pad_token_id=tok.eos_token_id,
-                                   use_cache=True, past_key_values=c)
-                return tok.decode(o[0, ids.shape[1]:], skip_special_tokens=True)
-            results[f"{method}_b{param}"] = {"acc": run_method(gen_fn, f"{method}_b{param}"),
-                                             "total_x": round(16 / eb, 2)}
-        else:
-            # token-eviction: effective compression = sum(seq_len) / sum(min(budget, seq_len)),
-            # since kept tokens stay fp16 (bits/elem ratio vs the full fp16 cache).
-            tok_acc = {"full": 0, "kept": 0}
-            def gen_fn(ids, mg, _m=method, _p=param, _a=tok_acc):
-                n = ids.shape[1]
-                _a["full"] += n; _a["kept"] += min(_p, n)
-                txt, _ = kvb.evict_generate(model, tok, heads, ids, mg, _m, _p)
-                return txt
-            acc = run_method(gen_fn, f"{method}_bud{param}")
-            tx = round(tok_acc["full"] / max(1, tok_acc["kept"]), 2)
-            results[f"{method}_bud{param}"] = {"acc": acc, "total_x": tx, "budget": param}
-
-    out = dict(model=args.model, opts=vars(args), tasks=tasks, results=results)
-    with open(args.out, "w") as f: json.dump(out, f, indent=2)
-    print("\n=== LONGBENCH SUMMARY (score %) ===", flush=True)
-    for k, v in results.items():
-        print(f"{k:24s} x={v.get('total_x', v.get('budget','-')):>6}  overall={v['acc']['overall']}", flush=True)
-    print(f"[out] {args.out}", flush=True)
+    scores = run_longbench(model, tok, dev, tasks, args.max_samples, args.max_length, not args.no_chat)
+    rec.update(scores={t: scores[t] for t in tasks}, overall=scores["overall"], n=scores["_n"],
+               context_lengths=scores["_len"], secs=round(time.time() - t0, 1))
+    if args.preset:
+        w = sum(model._spectra["window"]) if model._spectra["window"] else 0
+        rec["accounting"] = accounting_block(rec["latent_ratio"], scores["_len"], window=w)
+        print(f"[longbench] compression over the evaluated samples: {rec['accounting']['ratio']}x "
+              f"(latent {rec['latent_ratio']}x, exact window {w} tokens)", flush=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(rec, f, indent=1)
+    print(f"[out] {args.out}  overall={rec['overall']}  ({rec['secs']}s)", flush=True)
 
 
 if __name__ == "__main__":

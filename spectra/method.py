@@ -12,7 +12,10 @@ data-aware low-rank latent (see core.py):
                       (W_UP = (E[c_q^T c_q])^-1 E[c_q^T K]) so the up-projection compensates
                       quantization noise.
 
-Eval: wikitext-2 PPL + lm-eval (see scripts/run_ppl_lmeval.py).
+Exact window (the paper's `-B` presets): `set_exact_window` keeps the first `sink` and the last
+`recent` prompt positions of K and V exact (fp16) and quantizes everything else.
+
+PPL / lm-eval sweep: `python -m spectra.method --model ... --configs B:bits` (WikiText-2 PPL, optional lm-eval).
 """
 from __future__ import annotations
 import argparse, json, time, math
@@ -48,6 +51,42 @@ def rand_orthogonal(m, device, dtype, seed=0):
     return Q.to(device=device, dtype=dtype)
 
 
+def _apply_exact_window(mod, x, out_q):
+    """Overwrite the first `sink` and the last `recent` token positions (dim -2) with the exact fp16
+    projection x @ W + b. Prefill only (T > 1); decode tokens are always quantized. With a left-padded
+    batch the first positions of shorter rows are padding (this is how the paper's batched runs behave)."""
+    W = getattr(mod, "_W_exact", None)
+    if W is None or x.dim() < 2 or x.shape[-2] <= 1:
+        return out_q
+    recent, sink = int(getattr(mod, "recent", 0)), int(getattr(mod, "sink", 0))
+    if recent <= 0 and sink <= 0:
+        return out_q
+    T = x.shape[-2]
+    exact = x.to(W.dtype) @ W
+    if getattr(mod, "_b_exact", None) is not None:
+        exact = exact + mod._b_exact
+    exact = exact.to(out_q.dtype)
+    s = min(sink, T); r = min(recent, max(0, T - s))
+    out_q = out_q.clone()
+    if s > 0:
+        out_q[..., :s, :] = exact[..., :s, :]
+    if r > 0:
+        out_q[..., T - r:, :] = exact[..., T - r:, :]
+    return out_q
+
+
+@torch.no_grad()
+def set_exact_window(heads, WKo, WVo, kb, vb, sink=4, recent=64):
+    """Enable the exact window on every k_proj / v_proj (the paper's `-B` presets: sink 4, recent 64).
+    WKo / WVo are the ORIGINAL nn.Linear weights (out, in); kb / vb their biases (or None)."""
+    for l, layer in enumerate(heads.layers):
+        for mod, W, b in ((layer.self_attn.k_proj, WKo[l], kb[l]), (layer.self_attn.v_proj, WVo[l], vb[l])):
+            dev = mod.W_DOWN.device
+            mod.sink, mod.recent = int(sink), int(recent)
+            mod._W_exact = W.t().to(dev)                 # same layout as the paper runs (no copy)
+            mod._b_exact = None if b is None else b.to(dev)
+
+
 class LatentProjV2(nn.Module):
     """out = quant(x @ W_DOWN - mu) @ W_UP + beta + bias.  Heavy block (first heavy_k dims)
     quantized at heavy_bits; light block at bits. Rotation already absorbed into W_DOWN/W_UP."""
@@ -60,6 +99,7 @@ class LatentProjV2(nn.Module):
         self.bits, self.group = bits, group
         self.heavy_k, self.heavy_bits = heavy_k, heavy_bits
         self.bias = None if bias is None else nn.Parameter(bias, requires_grad=False)
+        self.sink = self.recent = 0                  # exact window, see set_exact_window
 
     def forward(self, x):
         c = x.to(self.W_DOWN.dtype) @ self.W_DOWN - self.mu
@@ -73,7 +113,7 @@ class LatentProjV2(nn.Module):
         out = c @ self.W_UP + self.beta
         if self.bias is not None:
             out = out + self.bias
-        return out
+        return _apply_exact_window(self, x, out)
 
 
 def run_lm_eval(model, tok, tasks, limit, bs=8):
@@ -95,6 +135,7 @@ def run_lm_eval(model, tok, tasks, limit, bs=8):
 def build_factor(W, Gl, hmean, r, ridge, hadamard, heavy_k, dtype, dev):
     """Return (W_DOWN, W_UP, mu) for one side. Rotation (Hadamard/orthogonal) on the LIGHT
     block is absorbed: c_light' = c_light R, W_UP_light' = R^T W_UP_light (same product)."""
+    Gl = Gl.to(W.device); hmean = hmean.to(W.device)      # statistics may live on SPECTRA_STATS_DEVICE
     WD, WU = lowrank_gweighted_factors(W, Gl, r, ridge)   # (d,r_eff),(r_eff,m)
     r_eff = WD.shape[1]                                    # actual rank (<= r, capped by W cols)
     if hadamard and heavy_k < r_eff:
@@ -192,6 +233,7 @@ class LatentProjWF(nn.Module):
         self.register_buffer("group_bits", group_bits.to(torch.long).contiguous())
         self.group_size = int(group_size)
         self.bias = None if bias is None else nn.Parameter(bias, requires_grad=False)
+        self.sink = self.recent = 0                  # exact window, see set_exact_window
 
     def forward(self, x):
         c = x.to(self.W_DOWN.dtype) @ self.W_DOWN - self.mu
@@ -199,7 +241,7 @@ class LatentProjWF(nn.Module):
         out = c @ self.W_UP + self.beta
         if self.bias is not None:
             out = out + self.bias
-        return out
+        return _apply_exact_window(self, x, out)
 
 
 def _wf_cache_frac(gbits_k, gbits_v, group_size, kvb):
@@ -244,7 +286,7 @@ def build_spectra_wf(model, heads, G, hmean, WKo, WVo, WOo, kb, vb, calib_w, dev
 
     tot_k = tot_v = None
     for l in range(heads.L):
-        Gl = G[l].double(); hm = hmean[l].double()
+        Gl = G[l].double().to(dev); hm = hmean[l].double().to(dev)
         cov = Gl - torch.outer(hm, hm)
         WK = WKo[l].t().double(); WV = WVo[l].t().double()
         # pure low-rank factors (no heavy/Hadamard; water-filling subsumes the heavy block)
@@ -300,8 +342,12 @@ def build_spectra(model, heads, G, hmean, WKo, WVo, WOo, kb, vb, calib_w, dev, d
         km._WK_orig = WK.to(dtype); vm._WV_orig = WV.to(dtype)
         heads.layers[l].self_attn.k_proj = km
         heads.layers[l].self_attn.v_proj = vm
-    cf = cache_frac(r_k, r_v, bits, args, 2 * heads.kv_dim)
-    return r_k, r_v, cf
+    # Account with the EFFECTIVE ranks: build_factor caps each side at the KV width (1024 on Llama / Mistral,
+    # 512 on Qwen2.5-7B), so a preset whose requested rank exceeds it stores a narrower latent than r_k / r_v.
+    rk_eff = heads.layers[0].self_attn.k_proj.W_DOWN.shape[1]
+    rv_eff = heads.layers[0].self_attn.v_proj.W_DOWN.shape[1]
+    cf = cache_frac(rk_eff, rv_eff, bits, args, 2 * heads.kv_dim)
+    return rk_eff, rv_eff, cf
 
 
 build_prism = build_spectra   # backward-compat alias (earlier working name)

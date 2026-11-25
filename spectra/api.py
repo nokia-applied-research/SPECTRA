@@ -1,15 +1,13 @@
-"""SPECTRA easy API — compress an HF model's KV cache in one call, then save / load / generate.
+"""SPECTRA easy API: compress an HF model's KV cache in one call, then save / load / generate.
 
     import spectra
-    model, tok = spectra.compress("meta-llama/Llama-2-7b-hf", ratio="9x")   # one line
-    print(tok.decode(model.generate(**tok("The KV cache is", return_tensors="pt").to(model.device),
-                                    max_new_tokens=40)[0]))
-    spectra.save(model, "spectra_llama2_8x")          # tiny delta (factors only, ~tens of MB)
-    model, tok = spectra.load("spectra_llama2_8x")    # rebuilds from the HF base + delta
+    model, tok = spectra.compress("NousResearch/Meta-Llama-3.1-8B-Instruct", preset="s95-B")
+    spectra.save(model, "spectra_l31_s95B")          # small delta: factors + healed o_proj
+    model, tok = spectra.load("spectra_l31_s95B")    # rebuilds from the HF base + delta
 
-`ratio` picks a tested operating point (see PRESETS below / the paper). Override with `bits=`/`B=` for a
-custom point. Compression replaces k_proj/v_proj with absorbed low-rank+quantized latent
-projections and heals o_proj in closed form — training-free, standard `model.generate` works.
+`preset` names one of the paper's operating points (PRESETS); a `-B` suffix keeps the first 4 and the last 64
+prompt tokens of K and V exact. Override with `B=` and `bits=` for a custom point. Compression replaces
+k_proj / v_proj with latent projections and heals o_proj in closed form; no training, and `model.generate` works.
 """
 from __future__ import annotations
 import json, os, time
@@ -17,27 +15,38 @@ from types import SimpleNamespace
 import torch
 
 from .core import AttnHeads, collect_grams_and_mean, make_windows
-from .method import build_spectra, LatentProjV2, LatentProjWF
+from .method import build_spectra, set_exact_window, LatentProjV2, LatentProjWF
+from .accounting import honest_ratio
 
-# Tested operating points from the HP sweep (Llama-3.1-8B, WikiText-2 PPL proxy; generalizes across
-# models since B scales with kv_dim). Each preset carries the FULL config (not just b_frac/bits):
-#   mode      "wf"      = full-rank(-ish) + group water-filling (near-lossless, 3-6x)
-#             "lowrank" = energy-ordered rank truncation + quant (aggressive, 9-12x)
-#   b_frac    latent width B as a fraction of the fp16 KV width (2*kv_dim)
-#   bits      avg bits/elem;  kv_ratio  K-rank fraction (V = 1-kv_ratio)
-#   group     quant group size;  heavy_k  #top channels kept at 8-bit;  hadamard  rotate light block
-# Regime findings: WF wants kv_ratio=0.5 (equal K/V); lowrank wants kv_ratio=0.33 (less-key-more-value)
-# + heavy_k=32; 12x additionally benefits from a Hadamard rotation on the light block.
+# The paper's operating points. B is the latent width summed over K and V (capped per side at the KV width of the
+# model), bits the average bits per latent value. mode "wf" = water-filling bit allocation over the energy-ordered
+# latent; "lowrank" = rank truncation with uniform bits, the top `heavy_k` channels at 8 bits, optional Hadamard.
+# The same preset gives different ratios on different models; the README lists the measured ones.
 PRESETS = {
-    "3x":  dict(mode="wf",      b_frac=1.0,   bits=4, kv_ratio=0.5,  group=64,  heavy_k=0,  hadamard=False),  # ~3.6x, +0.03 PPL
-    "5x":  dict(mode="wf",      b_frac=1.0,   bits=3, kv_ratio=0.5,  group=64,  heavy_k=0,  hadamard=False),  # ~4.6x, +0.14
-    "6x":  dict(mode="wf",      b_frac=0.75,  bits=3, kv_ratio=0.5,  group=128, heavy_k=0,  hadamard=False),  # ~6.6x, +0.51
-    "9x":  dict(mode="lowrank", b_frac=0.5,   bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False),  # ~9.5x, +1.07
-    "12x": dict(mode="lowrank", b_frac=0.375, bits=3, kv_ratio=0.33, group=64,  heavy_k=32, hadamard=True),   # ~12.2x, +1.70
-    # Paging-friendly symmetric uniform-bit LR for the vLLM int4 latent cache (spectra.vllm). Trades a
-    # little quality (kv_ratio=0.5, heavy_k=0, uniform 4-bit) for a fixed-width, byte-aligned latent.
-    "vllm-7x": dict(mode="lowrank", b_frac=0.5, bits=4, kv_ratio=0.5, group=64, heavy_k=0, hadamard=False),   # ~7.1x
+    "s35":   dict(mode="wf",      B=2048, bits=4, kv_ratio=0.5,  group=64,  heavy_k=0,  hadamard=False, center=True),
+    "t40b":  dict(mode="wf",      B=1792, bits=4, kv_ratio=0.5,  group=64,  heavy_k=0,  hadamard=False, center=True),
+    "s45":   dict(mode="wf",      B=2048, bits=3, kv_ratio=0.5,  group=64,  heavy_k=0,  hadamard=False, center=True),
+    "s65":   dict(mode="wf",      B=1536, bits=3, kv_ratio=0.5,  group=128, heavy_k=0,  hadamard=False, center=True),
+    "L48":   dict(mode="lowrank", B=2048, bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "L55":   dict(mode="lowrank", B=1792, bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "L65":   dict(mode="lowrank", B=1536, bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "L70":   dict(mode="lowrank", B=1408, bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "t80e":  dict(mode="lowrank", B=1216, bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "s95":   dict(mode="lowrank", B=1024, bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "s12":   dict(mode="lowrank", B=768,  bits=3, kv_ratio=0.33, group=64,  heavy_k=32, hadamard=True,  center=False),
+    # narrow-KV models (Qwen2.5-7B: 4 KV heads) reach the 8x tier only with a narrower latent
+    "w544":  dict(mode="lowrank", B=544,  bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "w512":  dict(mode="lowrank", B=512,  bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    "w512h": dict(mode="lowrank", B=512,  bits=3, kv_ratio=0.33, group=64,  heavy_k=32, hadamard=True,  center=False),
+    "w448":  dict(mode="lowrank", B=448,  bits=3, kv_ratio=0.33, group=128, heavy_k=32, hadamard=False, center=False),
+    # symmetric uniform 4-bit latent with a byte-aligned width, for the vLLM int4 cache (spectra.vllm); the width
+    # scales with the model (b_frac of the fp16 KV width)
+    "vllm-7x": dict(mode="lowrank", b_frac=0.5, bits=4, kv_ratio=0.5, group=64, heavy_k=0, hadamard=False, center=False),
 }
+# v0.1 names. Identical to the paper presets on 8-KV-head models (Llama-3.1-8B, Mistral-7B).
+ALIASES = {"3x": "s35", "5x": "s45", "6x": "s65", "9x": "s95", "12x": "s12"}
+SINK, RECENT = 4, 64                       # the `-B` exact window: 68 tokens of K and V kept in fp16
+CALIB_RECIPES = ("wikitext+code", "wikitext")
 
 
 def _default_args(**ov):
@@ -54,22 +63,50 @@ def _resolve_device(device):
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
-def _calib_windows(tok, seq_len, n, text=None):
-    if text is None:
-        from datasets import load_dataset
-        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-        text = "\n\n".join(t for t in ds["text"] if t.strip())
-    return make_windows(tok, text, seq_len, n)
+def parse_preset(name):
+    """'s12-B' -> ('s12', config dict, window on). Accepts the v0.1 aliases ('9x', ...)."""
+    window = name.endswith("-B")
+    base = name[:-2] if window else name
+    base = ALIASES.get(base, base)
+    if base not in PRESETS:
+        raise ValueError(f"unknown preset '{name}'; choose one of {list(PRESETS)} (optionally with -B) "
+                         f"or {list(ALIASES)}, or pass B= and bits=")
+    return base, dict(PRESETS[base]), window
+
+
+def make_calib_windows(tok, recipe="wikitext+code", n=16, seq_len=2048, text=None):
+    """Calibration windows of `seq_len` tokens. 'wikitext+code' (default, the paper's recipe): n/2 windows from
+    WikiText-2 train and n/2 from codeparrot-clean-valid. 'wikitext': n windows of WikiText-2 train (the recipe of
+    arXiv v1). `text` overrides both with your own corpus."""
+    if text is not None:
+        return make_windows(tok, text, seq_len, n)
+    from datasets import load_dataset
+    nl = "\n\n".join(t for t in load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")["text"]
+                     if t.strip())
+    if recipe == "wikitext":
+        return make_windows(tok, nl, seq_len, n)
+    if recipe != "wikitext+code":
+        raise ValueError(f"calib must be one of {CALIB_RECIPES}")
+    code = "\n\n".join(str(x) for x in
+                       load_dataset("codeparrot/codeparrot-clean-valid", split="train")[:800]["content"])
+    nl_ids = tok(nl, return_tensors="pt").input_ids[0]
+    code_ids = tok(code, return_tensors="pt").input_ids[0]
+    n_code = n // 2; n_nl = n - n_code
+    wins = ([nl_ids[i * seq_len:(i + 1) * seq_len] for i in range(n_nl)]
+            + [code_ids[i * seq_len:(i + 1) * seq_len] for i in range(n_code)])
+    return [w for w in wins if w.numel() == seq_len]
 
 
 @torch.no_grad()
-def compress(model, tokenizer=None, ratio="9x", *, bits=None, B=None,
-             calib_text=None, calib_windows=64, seq_len=2048,
+def compress(model, tokenizer=None, preset="s95-B", *, ratio=None, B=None, bits=None, window=None,
+             calib="wikitext+code", calib_windows=16, calib_text=None, seq_len=2048,
              device=None, dtype=torch.float16, verbose=True):
-    """Compress `model` (an HF model or a HF model-id string) in place. Returns (model, tok).
+    """Compress `model` (an HF model or a model id) in place. Returns (model, tok).
 
-    ratio: one of PRESETS ("3x","5x","6x","9x","12x","vllm-7x") — or override with bits=/B=.
-    calib_*: tiny activation calibration (default 64 wikitext-2 windows; ~seconds on a GPU).
+    preset : a PRESETS name, optionally with `-B` (exact window). `ratio=` is the v0.1 name of this argument.
+    B, bits: a custom operating point (latent width, average bits) instead of a preset.
+    window : keep the first 4 and last 64 prompt tokens exact (default: on for `-B` presets).
+    calib  : 'wikitext+code' (the paper's recipe, 8 + 8 windows of 2048 tokens) or 'wikitext'.
     """
     torch.set_grad_enabled(False)
     dev = _resolve_device(device)
@@ -86,32 +123,27 @@ def compress(model, tokenizer=None, ratio="9x", *, bits=None, B=None,
             raise ValueError("pass a tokenizer when compressing an already-loaded model")
         model = model.to(dev).eval()
     tok = tokenizer
-
-    preset = dict(PRESETS.get(ratio, {}))
-    if not preset and (B is None or bits is None):
-        raise ValueError(f"unknown ratio '{ratio}'; choose {list(PRESETS)} or pass B= and bits=")
-    mode = preset.get("mode", "wf" if (B and bits and bits >= 4) else "lowrank")
-    eff_bits = bits if bits is not None else preset["bits"]
-
     heads = AttnHeads(model)
-    kv_full = 2 * heads.kv_dim                                   # fp16 KV width
-    eff_B = B if B is not None else max(1, int(round(preset["b_frac"] * kv_full)))
 
-    args = _default_args(
-        water_filling=(mode == "wf"),
-        kv_ratio=preset.get("kv_ratio", 0.5 if mode == "wf" else 0.33),
-        center=(mode == "wf"),
-        group=preset.get("group", 64),
-        heavy_k=preset.get("heavy_k", 0),
-        hadamard=preset.get("hadamard", False),
-    )
-
+    name = ratio if ratio is not None else preset
+    if B is not None and bits is not None:
+        mode = "wf" if bits >= 4 else "lowrank"
+        cfg = dict(mode=mode, B=B, bits=bits, kv_ratio=0.5 if mode == "wf" else 0.33, group=64,
+                   heavy_k=0, hadamard=False, center=(mode == "wf"))          # as in v0.1
+        base, keep = f"custom-B{B}-b{bits}", bool(window)
+    else:
+        base, cfg, keep = parse_preset(name)
+        keep = keep if window is None else bool(window)
+    eff_B = cfg["B"] if "B" in cfg else max(1, int(round(cfg["b_frac"] * 2 * heads.kv_dim)))
+    args = _default_args(water_filling=(cfg["mode"] == "wf"), kv_ratio=cfg["kv_ratio"], center=cfg["center"],
+                         group=cfg["group"], heavy_k=cfg["heavy_k"], heavy_bits=8, hadamard=cfg["hadamard"])
+    label = base + ("-B" if keep else "")
     if verbose:
         print(f"[spectra] {model_id}  arch={heads.arch} L={heads.L} kv_dim={heads.kv_dim}", flush=True)
-        print(f"[spectra] ratio={ratio} mode={mode} B={eff_B} bits={eff_bits}", flush=True)
+        print(f"[spectra] preset={label} mode={cfg['mode']} B={eff_B} bits={cfg['bits']} calib={calib}", flush=True)
 
     t0 = time.time()
-    cw = _calib_windows(tok, seq_len, calib_windows, calib_text)
+    cw = make_calib_windows(tok, calib, calib_windows, seq_len, calib_text)
     G, hmean = collect_grams_and_mean(model, heads, cw, dev)
     WKo = [l.self_attn.k_proj.weight.detach().clone() for l in heads.layers]
     WVo = [l.self_attn.v_proj.weight.detach().clone() for l in heads.layers]
@@ -120,15 +152,21 @@ def compress(model, tokenizer=None, ratio="9x", *, bits=None, B=None,
           for l in heads.layers]
     vb = [(l.self_attn.v_proj.bias.detach().clone() if l.self_attn.v_proj.bias is not None else None)
           for l in heads.layers]
-
     r_k, r_v, cf = build_spectra(model, heads, G, hmean, WKo, WVo, WOo, kb, vb,
-                                 cw, dev, dtype, eff_B, eff_bits, args)
-    model._spectra = dict(base_model=model_id, ratio=ratio, mode=mode, B=eff_B, bits=eff_bits,
-                          r_k=r_k, r_v=r_v, cache_frac=cf, compression=round(1.0 / cf, 2),
-                          group=args.group)
+                                 cw, dev, dtype, eff_B, cfg["bits"], args)
+    if keep:
+        set_exact_window(heads, WKo, WVo, kb, vb, SINK, RECENT)
+    comp = round(1.0 / cf, 2)
+    model._spectra = dict(base_model=model_id, preset=label, mode=cfg["mode"], B=eff_B, bits=cfg["bits"],
+                          r_k=r_k, r_v=r_v, cache_frac=cf, compression=comp, group=args.group,
+                          window=[SINK, RECENT] if keep else None, calib=calib, calib_windows=len(cw))
     if verbose:
-        print(f"[spectra] done in {time.time()-t0:.1f}s  cache={cf:.4f}  "
-              f"compression={1/cf:.2f}x  (r_k={r_k} r_v={r_v})", flush=True)
+        msg = f"[spectra] done in {time.time() - t0:.1f}s  latent ratio {comp:.2f}x (r_k={r_k} r_v={r_v})"
+        if keep:
+            w = SINK + RECENT
+            msg += (f"; with the {w}-token exact window: {honest_ratio(comp, [8192], w):.2f}x at 8K, "
+                    f"{honest_ratio(comp, [32768], w):.2f}x at 32K")
+        print(msg, flush=True)
     return model, tok
 
 
@@ -154,9 +192,8 @@ def _build_module(kind, sc, t):
 
 
 def save(model, path):
-    """Save a SPECTRA-compressed model as a lean delta (factors + healed o_proj only). The HF
-    base weights are NOT duplicated — `load` re-fetches them by id. Writes <path>/spectra.pt and
-    <path>/meta.json."""
+    """Save a compressed model as a lean delta (factors + healed o_proj). The HF base weights are not duplicated:
+    `load` fetches them by id. Writes <path>/spectra.pt and <path>/meta.json."""
     if not hasattr(model, "_spectra"):
         raise ValueError("model was not compressed by spectra.compress()")
     os.makedirs(path, exist_ok=True)
@@ -169,7 +206,7 @@ def save(model, path):
         layers.append(dict(k_kind=kk, k_scalars=ks, k_tensors={n: x.cpu() for n, x in kt.items()},
                            v_kind=vk, v_scalars=vs, v_tensors={n: x.cpu() for n, x in vt.items()},
                            o_proj_weight=sa.o_proj.weight.detach().cpu()))
-    meta = dict(format="spectra-delta-v1", **model._spectra)
+    meta = dict(format="spectra-delta-v2", **model._spectra)
     torch.save(dict(meta=meta, layers=layers), os.path.join(path, "spectra.pt"))
     with open(os.path.join(path, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -178,8 +215,8 @@ def save(model, path):
 
 @torch.no_grad()
 def load(path, tokenizer=None, *, device=None, dtype=torch.float16, verbose=True):
-    """Rebuild a compressed model from a delta saved by `save`: fetch the HF base by id, overlay
-    the SPECTRA factors and healed o_proj. Returns (model, tok)."""
+    """Rebuild a compressed model from a delta saved by `save`: fetch the HF base by id, overlay the SPECTRA
+    factors and healed o_proj, and restore the exact window from the base k/v weights. Returns (model, tok)."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
     torch.set_grad_enabled(False)
     dev = _resolve_device(device)
@@ -187,12 +224,17 @@ def load(path, tokenizer=None, *, device=None, dtype=torch.float16, verbose=True
     meta, layers = blob["meta"], blob["layers"]
     base = meta["base_model"]
     if verbose:
-        print(f"[spectra] loading base {base} + delta ({meta['ratio']}, {meta['compression']}x)", flush=True)
+        print(f"[spectra] loading base {base} + delta ({meta.get('preset', meta.get('ratio'))}, "
+              f"latent ratio {meta['compression']}x)", flush=True)
     tok = tokenizer or AutoTokenizer.from_pretrained(base)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(dev).eval()
     heads = AttnHeads(model)
+    WKo = [l.self_attn.k_proj.weight.detach() for l in heads.layers]
+    WVo = [l.self_attn.v_proj.weight.detach() for l in heads.layers]
+    kb = [(None if l.self_attn.k_proj.bias is None else l.self_attn.k_proj.bias.detach()) for l in heads.layers]
+    vb = [(None if l.self_attn.v_proj.bias is None else l.self_attn.v_proj.bias.detach()) for l in heads.layers]
     for l, spec in zip(heads.layers, layers):
         sa = l.self_attn
         kt = {n: x.to(dev, dtype) for n, x in spec["k_tensors"].items()}
@@ -204,6 +246,8 @@ def load(path, tokenizer=None, *, device=None, dtype=torch.float16, verbose=True
         sa.k_proj = _build_module(spec["k_kind"], spec["k_scalars"], kt).to(dev)
         sa.v_proj = _build_module(spec["v_kind"], spec["v_scalars"], vt).to(dev)
         sa.o_proj.weight.copy_(spec["o_proj_weight"].to(dev, dtype))
+    if meta.get("window"):
+        set_exact_window(heads, WKo, WVo, kb, vb, *meta["window"])
     model._spectra = {k: v for k, v in meta.items() if k != "format"}
     return model, tok
 
@@ -211,13 +255,14 @@ def load(path, tokenizer=None, *, device=None, dtype=torch.float16, verbose=True
 # ----------------------------------------------------------------------------------------- CLI
 def _main():
     import argparse
-    ap = argparse.ArgumentParser(description="SPECTRA easy CLI: compress an HF model & save the delta.")
+    ap = argparse.ArgumentParser(description="SPECTRA CLI: compress an HF model and save the delta, or generate.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("compress", help="compress an HF model and save a SPECTRA delta")
     c.add_argument("--model", required=True)
-    c.add_argument("--ratio", default="9x", help=f"one of {list(PRESETS)} or use --B/--bits")
+    c.add_argument("--preset", default="s95-B", help=f"one of {list(PRESETS)}, optionally with -B")
     c.add_argument("--bits", type=int, default=None)
     c.add_argument("--B", type=int, default=None)
+    c.add_argument("--calib", default="wikitext+code", choices=CALIB_RECIPES)
     c.add_argument("--calib-windows", type=int, default=16)
     c.add_argument("--device", default=None)
     c.add_argument("--out", required=True)
@@ -230,7 +275,7 @@ def _main():
     args = ap.parse_args()
 
     if args.cmd == "compress":
-        model, tok = compress(args.model, ratio=args.ratio, bits=args.bits, B=args.B,
+        model, tok = compress(args.model, preset=args.preset, bits=args.bits, B=args.B, calib=args.calib,
                               calib_windows=args.calib_windows, device=args.device)
         save(model, args.out)
         print(f"[spectra] saved delta -> {args.out}")

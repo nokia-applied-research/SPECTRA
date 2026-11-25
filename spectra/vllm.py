@@ -3,8 +3,8 @@
 Stores the SPECTRA **int4 latent** (r-dim, symmetric uniform-bit LR) directly in vLLM's paged KV cache, so
 vLLM allocates ~N× more KV blocks at fixed GPU memory (real capacity / concurrency gain, measured
 end-to-end). On read it gathers the latent by block-table, dequantizes, reconstructs K/V (up-projection),
-applies EXACT RoPE, and attends. Reconstruction is training-free and exact (Mode A); a production fused
-Triton decode kernel is future work (see README → Efficiency).
+applies EXACT RoPE, and attends. Reconstruction is training-free and exact (Mode A). Keys and values are rebuilt
+at every step, so decode is slower than dense attention: this path saves memory, not time.
 
 Only the paging-friendly symmetric uniform-bit LR points are supported here (fixed width, byte-aligned);
 the water-filling / heavy-k presets stay HF-only (quality mode, `spectra.compress`).
@@ -21,7 +21,7 @@ Usage
     print(llm.generate(["The capital of France is"], ...))
 
 Requires the vLLM stack (vllm 0.7.x + transformers 4.48.x); enforce_eager=True (the read path is a
-Python reference — correct + memory-real, not yet the fused kernel).
+PyTorch reference, not a fused kernel).
 """
 from __future__ import annotations
 import os, math, torch

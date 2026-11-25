@@ -34,7 +34,7 @@ RoPE-agnostic correction and measure its real-model PPL cost — quantifying the
 deliberate goal of this step (cf. kvshare.md 3.7 softmax/relative-position risk).
 """
 from __future__ import annotations
-import argparse, json, math, time
+import argparse, json, math, os, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -79,6 +79,16 @@ def _sym_sqrt_inv_sqrt(G, ridge):
     return (Q * s) @ Q.t(), (Q * si) @ Q.t()
 
 
+def stats_device(device):
+    """Where the fp64 calibration statistics (G, GYY/GYZ, the RRR precompute) and the weight
+    snapshots live. Default: the model device. SPECTRA_STATS_DEVICE=cuda:1 parks them on a second
+    GPU so a 32B model fits next to one H200's worth of weights (Qwen3-32B: 61 GiB of weights plus
+    ~65 GiB of fp64 statistics and two attention snapshots OOM'd at the W_O healing step). Every
+    consumer moves ONE layer's statistics back next to the weights before using them, so the
+    arithmetic and its summation order are unchanged."""
+    return os.environ.get("SPECTRA_STATS_DEVICE") or device
+
+
 # ----------------------------------------------------------- architecture abstraction
 class AttnHeads:
     """Per-head Q/K/V/O access in the row-vector convention  q = a @ W_Q,
@@ -103,7 +113,7 @@ class AttnHeads:
             self.d = cfg.hidden_size
         else:
             raise ValueError("unsupported architecture")
-        self.hd = getattr(cfg, "head_dim", self.d // self.H)
+        self.hd = getattr(cfg, "head_dim", None) or (self.d // self.H)  # v0.3 Mistral: head_dim key present but None
         # GQA support: K and V projections produce kv_dim (smaller than d).
         # Q and O are still d-dim. tie/offcache/eorakv per-head variants are MHA-only.
         self.kv_dim = self.Hkv * self.hd
@@ -169,9 +179,10 @@ class AttnHeads:
     # --- snapshot / restore the attention weights of given layers (memory-cheap)
     def snapshot(self, layers):
         snap = {}
+        sd = os.environ.get("SPECTRA_STATS_DEVICE")   # see stats_device(); restore() copies across devices
         for l in layers:
             mats = self._get(l)
-            snap[l] = [m.detach().clone() for m in mats]
+            snap[l] = [m.detach().to(sd, copy=True) if sd else m.detach().clone() for m in mats]
         return snap
 
     @torch.no_grad()
@@ -294,8 +305,9 @@ def _accumulate_streaming_stats(heads, orig_snap, tied_snap, calib_w, device):
     L, d = heads.L, heads.d
     din = heads.H * heads.hd            # o_proj INPUT dim (= concat of all Q heads' context)
     dout = d                            # o_proj OUTPUT dim (= hidden). din != dout for Qwen3.
-    GYY = [torch.zeros(din, din, dtype=torch.float64, device=device) for _ in range(L)]
-    GYZ = [torch.zeros(din, dout, dtype=torch.float64, device=device) for _ in range(L)]
+    sd = stats_device(device)
+    GYY = [torch.zeros(din, din, dtype=torch.float64, device=sd) for _ in range(L)]
+    GYZ = [torch.zeros(din, dout, dtype=torch.float64, device=sd) for _ in range(L)]
     n_per = [0 for _ in range(L)]
     cache = {"y": [None] * L, "z_tied": [None] * L, "z_orig": [None] * L,
              "phase": "tied"}                                          # "tied" or "orig"
@@ -337,8 +349,8 @@ def _accumulate_streaming_stats(heads, orig_snap, tied_snap, calib_w, device):
             for l in range(L):
                 y = cache["y"][l]
                 dz = cache["z_orig"][l] - cache["z_tied"][l]
-                GYY[l] += y.t() @ y
-                GYZ[l] += y.t() @ dz
+                GYY[l] += (y.t() @ y).to(sd)
+                GYZ[l] += (y.t() @ dz).to(sd)
                 n_per[l] += y.shape[0]
                 cache["y"][l] = cache["z_tied"][l] = cache["z_orig"][l] = None
     finally:
@@ -455,16 +467,17 @@ def collect_grams_and_mean(model, heads, windows, device):
     """Like collect_grams but also returns per-layer activation mean E[h] (for the bias /
     mean-centering co-design). Returns (G_list, hmean_list)."""
     L, d = heads.L, heads.d
-    G = [torch.zeros(d, d, dtype=torch.float64, device=device) for _ in range(L)]
-    S = [torch.zeros(d, dtype=torch.float64, device=device) for _ in range(L)]
+    sd = stats_device(device)
+    G = [torch.zeros(d, d, dtype=torch.float64, device=sd) for _ in range(L)]
+    S = [torch.zeros(d, dtype=torch.float64, device=sd) for _ in range(L)]
     cnt = [0 for _ in range(L)]
     hooks = []
 
     def mk(l):
         def pre_hook(mod, args):
             a = args[0].reshape(-1, args[0].shape[-1]).double()
-            G[l] += a.t() @ a
-            S[l] += a.sum(0)
+            G[l] += (a.t() @ a).to(sd)
+            S[l] += a.sum(0).to(sd)
             cnt[l] += a.shape[0]
         return pre_hook
 
@@ -509,7 +522,7 @@ def fit_apply_mla_split(heads, G, mla_layers, rank_k, rank_v, ridge, device):
     Lets us isolate K-only vs V-only compressibility/compensability."""
     d, kv = heads.d, heads.kv_dim
     for l in mla_layers:
-        Gl = G[l]
+        Gl = G[l].to(device)
         WK = _get_full_rowconv_live(heads, l, "K")        # (d, kv)
         WV = _get_full_rowconv_live(heads, l, "V")        # (d, kv)
         WK_new = _lowrank_gweighted(WK, Gl, rank_k, ridge)
@@ -609,13 +622,15 @@ def _rrr_precompute(heads, GYY, GYZ, n_per, ridge):
     L = heads.L
     out = []
     for l in range(L):
-        A = GYY[l] / max(n_per[l], 1)
-        B = GYZ[l] / max(n_per[l], 1)
+        dev = _oproj_module(heads, l).weight.device
+        A = (GYY[l] / max(n_per[l], 1)).to(dev)
+        B = (GYZ[l] / max(n_per[l], 1)).to(dev)
         Csqrt, Cinv = _sym_sqrt_inv_sqrt(A, ridge)
         W = (Cinv @ Cinv) @ B
         Mw = Csqrt @ W
         U, S, Vh = _robust_svd(Mw, full_matrices=False)
-        out.append((Cinv.float(), U.float(), S.float(), Vh.float()))
+        sd = stats_device(dev)
+        out.append((Cinv.float().to(sd), U.float().to(sd), S.float().to(sd), Vh.float().to(sd)))
     return out
 
 
@@ -625,7 +640,8 @@ def _rrr_apply(heads, precomp, rank):
     L = len(precomp)
     ranks_norm, kept = [], []
     for l in range(L):
-        Cinv, U, S, Vh = (t.double() for t in precomp[l])
+        dev = _oproj_module(heads, l).weight.device
+        Cinv, U, S, Vh = (t.double().to(dev) for t in precomp[l])
         r = min(rank, S.shape[0])
         Mw_r = (U[:, :r] * S[:r]) @ Vh[:r, :]
         dW_r = Cinv @ Mw_r
@@ -679,7 +695,8 @@ def _rrr_apply_adaptive(heads, precomp, total_budget):
     r_per = _waterfill_budget(precomp, total_budget)
     L = len(precomp)
     for l in range(L):
-        Cinv, U, S, Vh = (t.double() for t in precomp[l])
+        dev = _oproj_module(heads, l).weight.device
+        Cinv, U, S, Vh = (t.double().to(dev) for t in precomp[l])
         r = r_per[l]
         if r <= 0:
             continue

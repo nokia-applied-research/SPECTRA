@@ -1,6 +1,7 @@
 """Real-memory HF serving for SPECTRA: a KV cache that stores the PACKED int4 low-rank LATENT (not fp16
 K/V), so model.generate() uses memory at the true compression rate. Mode A: reconstruct K,V from the latent
-+ exact RoPE at read. Enable on a spectra.compress(...ratio="vllm-7x") model via enable(model)."""
++ exact RoPE at read (slower than dense attention: this path saves memory, not time). Enable on a
+spectra.compress(..., preset="vllm-7x") model via enable(model, cache). Llama-family models."""
 import torch, types, math
 import torch.nn.functional as F
 

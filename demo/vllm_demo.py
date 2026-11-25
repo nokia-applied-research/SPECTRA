@@ -17,9 +17,9 @@ import argparse
 
 def build(a):
     import spectra
-    m, tok = spectra.compress(a.model, ratio=a.ratio, calib_windows=a.calib_windows)
+    m, tok = spectra.compress(a.model, preset=a.preset, calib_windows=a.calib_windows)
     spectra.save(m, a.out)
-    print(f"[demo] saved {a.ratio} delta ({m._spectra['compression']}x, r_k={m._spectra['r_k']}) -> {a.out}")
+    print(f"[demo] saved {a.preset} delta ({m._spectra['compression']}x, r_k={m._spectra['r_k']}) -> {a.out}")
 
 
 def serve(a):
@@ -43,7 +43,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build", help="HF: compress + save a vLLM-friendly SPECTRA latent delta")
     b.add_argument("--model", required=True)
-    b.add_argument("--ratio", default="vllm-7x", help="paging-friendly symmetric LR preset (vllm-7x)")
+    b.add_argument("--preset", default="vllm-7x", help="paging-friendly symmetric uniform-bit preset (vllm-7x)")
     b.add_argument("--calib-windows", type=int, default=16)
     b.add_argument("--out", required=True)
     s = sub.add_parser("serve", help="vLLM: serve with the int4 latent cache")
