@@ -40,3 +40,17 @@ def accounting_block(latent_ratio, len_map, window=68):
         "median_context_len": med,
         "definition": "sum_i dense(L_i) / sum_i spectra(L_i), byte-weighted over the evaluated samples",
     }
+
+
+def flash_accounting(len_map, record_bytes=576, dense_bytes=4096, sink=4, window=127):
+    """SPECTRA-Flash KV bytes per layer against dense, byte-weighted over the evaluated samples. Every token from
+    position `sink` on has a fp8 record entry (512 latent + 64 RoPE dims = 576 B); the first `sink` and the last
+    `window - sink` tokens also stay exact in bf16 (dense_bytes = 2 x KV width x 2 B; 4096 B on Llama-3.1-8B)."""
+    all_lens = [L for lens in len_map.values() for L in lens]
+    if not all_lens:
+        return None
+    dense = sum(L * dense_bytes for L in all_lens)
+    flash = sum((L - min(L, sink)) * record_bytes + min(L, window) * dense_bytes for L in all_lens)
+    return {"ratio": round(dense / flash, 4), "nominal_ratio": round(dense_bytes / record_bytes, 4),
+            "record_bytes": record_bytes, "window_tokens": window, "n_samples": len(all_lens),
+            "definition": "sum_i dense(L_i) / sum_i flash(L_i), record + exact window, byte-weighted"}

@@ -5,24 +5,33 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spectra-kv"
 version = "0.2.0"
-description = "SPECTRA: training-free KV-cache compression by spectral transform coding."
+description = "SPECTRA: training-free KV-cache compression by spectral transform coding, and SPECTRA-Flash for fast decode."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.5",
-    "transformers>=4.57,<6",
-    "datasets>=2.18,<4",
+    "transformers>=4.57",
+    "datasets>=2.18",
     "numpy>=1.26",
+    "safetensors",
+    "huggingface_hub",
 ]
 
 [project.optional-dependencies]
 eval = ["rouge", "fuzzywuzzy", "jieba"]          # LongBench metrics (official metrics.py)
+flash = ["vllm==0.29.*"]                         # SPECTRA-Flash: FlashMLA + vLLM kernels, decode engine, vLLM plugin
 ppl = ["lm-eval>=0.4"]
 tools = ["matplotlib>=3.9"]
 
+[project.scripts]
+spectra-flash = "spectra.flash.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+spectra_flash = "spectra.flash.vllm:plugin"
+
 [tool.setuptools]
-packages = ["spectra", "spectra.eval"]
+packages = ["spectra", "spectra.eval", "spectra.flash", "spectra.flash.vllm"]
 
 [tool.setuptools.package-data]
 "spectra.eval" = ["config/*.json"]
