@@ -14,7 +14,7 @@ Lower-level pieces:
     from spectra.accounting import honest_ratio           # compression ratio with the exact window counted
     from spectra.eval import longbench, niah              # the paper's evaluation protocols
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .core import AttnHeads
 from .method import build_spectra, build_factor, set_exact_window, LatentProjV2, LatentProjWF, cache_frac

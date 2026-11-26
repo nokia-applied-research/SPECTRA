@@ -5,9 +5,11 @@ the same KV-cache memory; Flash fits more requests into it. All requests (random
 --output-len tokens, EOS ignored) are submitted at once and vLLM's scheduler batches them as memory allows: the
 numbers include scheduling, prefill and decode. Reported: KV capacity (tokens, and requests of this length), wall time,
 requests/s and output / total tokens/s.
-Both variants: bfloat16, no prefix caching, the whole prompt in one prefill step (Flash v0.2 needs it; dense uses the
-same scheduler settings).
+Both variants: bfloat16, no prefix caching, the whole prompt in one prefill step (Flash needs it; dense uses the
+same scheduler settings), PyTorch's expandable-segments allocator (a 128K-token prefill otherwise fragments the cache).
+Qwen3.5 models (`qwen3_5`) run text-only (--language-model-only) and Flash with --block-size 540.
   spectra-flash bench serve --params <dir|repo> [--input-len 32768 --output-len 256 --num-prompts 256 --gpus 0,1]
+  spectra-flash bench serve --model Qwen/Qwen3.5-9B --params <dir|repo> --input-len 32000 --output-len 8192
 """
 from __future__ import annotations
 
@@ -22,18 +24,45 @@ import time
 RESULT = "BENCH_SERVE_RESULT "
 
 
+def is_qwen35(model: str) -> bool:
+    try:
+        from transformers import AutoConfig
+        return AutoConfig.from_pretrained(model).model_type == "qwen3_5"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def engine_kwargs(model: str, variant: str, params: str, maxlen: int, gpu_mem: float, max_num_seqs: int) -> dict:
+    """vLLM engine args of one bench variant: the same scheduler settings for dense and Flash."""
+    kw = dict(model=model, dtype="bfloat16", enable_prefix_caching=False, enable_chunked_prefill=False,
+              max_model_len=maxlen, max_num_batched_tokens=maxlen, gpu_memory_utilization=gpu_mem,
+              max_num_seqs=max_num_seqs, seed=0)
+    if is_qwen35(model):
+        kw["language_model_only"] = True
+        if variant == "flash8":
+            kw["hf_overrides"] = {"spectra_flash": params}
+            kw["block_size"] = 540
+    elif variant == "flash8":
+        kw["hf_overrides"] = {"architectures": ["SpectraFlashLlamaForCausalLM"], "spectra_flash": params}
+    return kw
+
+
+def child_env(gpu: str) -> dict:
+    return {**os.environ, "CUDA_VISIBLE_DEVICES": gpu,
+            "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")}
+
+
+CONCURRENCY = re.compile(r"GPU KV cache size: ([\d,]+) tokens, Maximum concurrency for ([\d,]+) tokens per request: "
+                         r"([\d.]+)x")
+
+
 def child(a) -> int:
     import random
 
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
     maxlen = a.input_len + a.output_len + 16
-    kw = dict(model=a.model, dtype="bfloat16", enable_prefix_caching=False, enable_chunked_prefill=False,
-              max_model_len=maxlen, max_num_batched_tokens=maxlen, gpu_memory_utilization=a.gpu_mem,
-              max_num_seqs=a.max_num_seqs, seed=0)
-    if a.variant == "flash8":
-        kw["hf_overrides"] = {"architectures": ["SpectraFlashLlamaForCausalLM"], "spectra_flash": a.params}
-    llm = LLM(**kw)
+    llm = LLM(**engine_kwargs(a.model, a.variant, a.params, maxlen, a.gpu_mem, a.max_num_seqs))
     rng = random.Random(a.seed)
     prompts = [TokensPrompt(prompt_token_ids=[rng.randrange(1000, 120000) for _ in range(a.input_len)])
                for _ in range(a.num_prompts)]
@@ -55,13 +84,12 @@ def run_variant(a, variant: str, gpu: str, log_path: str) -> dict:
            "--num-prompts", str(a.num_prompts), "--gpu-mem", str(a.gpu_mem), "--max-num-seqs", str(a.max_num_seqs),
            "--seed", str(a.seed)]
     with open(log_path, "w") as f:
-        p = subprocess.run(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu}, stdout=f, stderr=subprocess.STDOUT)
+        p = subprocess.run(cmd, env=child_env(gpu), stdout=f, stderr=subprocess.STDOUT)
     text = open(log_path).read()
     res = next((json.loads(l[len(RESULT):]) for l in text.splitlines() if l.startswith(RESULT)), None)
     if p.returncode != 0 or res is None:
         raise RuntimeError(f"{variant} failed (exit {p.returncode}); log: {log_path}\n" + "\n".join(text.splitlines()[-20:]))
-    m = re.search(r"GPU KV cache size: ([\d,]+) tokens, Maximum concurrency for ([\d,]+) tokens per request: ([\d.]+)x",
-                  text)
+    m = CONCURRENCY.search(text)
     if m:
         res.update(kv_tokens=int(m.group(1).replace(",", "")), max_concurrency=float(m.group(3)))
     return res

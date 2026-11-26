@@ -36,6 +36,14 @@ def register() -> None:
     if QUALIFIED_OP_NAME not in CompilationConfig._attention_ops:
         CompilationConfig._attention_ops.append(QUALIFIED_OP_NAME)       # a piecewise splitting op
     ModelRegistry.register_model(ARCH, "spectra.flash.vllm.model:SpectraFlashLlamaForCausalLM")
+    try:                                                                 # Qwen3.5 hybrids (qwen3_5)
+        from . import qwen35
+        qwen35.patch()
+        if qwen35.QUALIFIED_OP_NAME not in CompilationConfig._attention_ops:
+            CompilationConfig._attention_ops.append(qwen35.QUALIFIED_OP_NAME)
+    except Exception as e:  # noqa: BLE001  never break vLLM for other models
+        import logging
+        logging.getLogger("vllm.spectra").warning("SPECTRA-Flash Qwen3.5 patch not applied: %r", e)
     _REGISTERED = True
 
 

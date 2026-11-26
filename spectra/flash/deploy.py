@@ -61,7 +61,7 @@ def load(path_or_repo: str, dev, hkv: int, hd: int):
     d = resolve(path_or_repo)
     p = P.load(d)
     blocks = {g0: fold_block(bp, p["n"], hkv, hd, dev) for g0, bp in p["blocks"].items()}
-    qs = {g0 + li: bp["qscale"][li] for g0, bp in p["blocks"].items() for li in range(p["n"])}
+    qs = {l: bp["qscale"][li] for bp in p["blocks"].values() for li, l in enumerate(bp["layers"])}
     return p["n"], blocks, qs, p["meta"], d
 
 

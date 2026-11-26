@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spectra-kv"
-version = "0.2.0"
+version = "0.3.0"
 description = "SPECTRA: training-free KV-cache compression by spectral transform coding, and SPECTRA-Flash for fast decode."
 readme = "README.md"
 license = { text = "MIT" }

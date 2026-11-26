@@ -10,5 +10,4 @@ jieba
 # optional:
 # lm-eval>=0.4               # zero-shot accuracy in `python -m spectra.method --lm-eval`
 # matplotlib>=3.9            # scripts/tools figures
-# triton>=3.0                # scripts/tools/bench_kernel.py
 # SPECTRA-Flash: vllm==0.29.* (Hopper GPU)

@@ -290,6 +290,7 @@ class WindowCache(nn.Module, AttentionLayerBase):
             self.k = self.v = self.k_cache = self.v_cache = None
             return
         D, nb = self.head_size, kv_cache.shape[0]
+        self.capacity = kv_cache.shape[2]                         # a hybrid model's allocator may scale the ring block up
         bnhc = kv_cache.transpose(1, 2)                           # (blocks, capacity, HKV, 2 D)
         assert bnhc.stride(3) == 1 and bnhc.stride(2) == 2 * D, bnhc.stride()
         assert bnhc.stride(1) == self.num_kv_heads * 2 * D and bnhc.stride(0) == self.capacity * bnhc.stride(1), \

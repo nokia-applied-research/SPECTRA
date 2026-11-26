@@ -7,7 +7,7 @@
 KV-cache compression by spectral transform coding, for 🤗 Transformers and vLLM.
 
 [![arXiv](https://img.shields.io/badge/arXiv-2608.07915-b31b1b.svg)](https://arxiv.org/abs/2608.07915)
-[![Models](https://img.shields.io/badge/%F0%9F%A4%97%20models-SPECTRA--Flash-ffcc4d.svg)](#released-model)
+[![Models](https://img.shields.io/badge/%F0%9F%A4%97%20models-SPECTRA--Flash-ffcc4d.svg)](#released-models)
 [![vLLM](https://img.shields.io/badge/vLLM-0.29-30a2ff.svg)](#serving-with-vllm)
 [![Transformers](https://img.shields.io/badge/transformers-%E2%89%A54.57-ffcc4d.svg)](#quick-start)
 [![Python](https://img.shields.io/badge/python-%E2%89%A53.10-3776ab.svg)](#installation)
@@ -35,6 +35,8 @@ activations. (b) Reverse water-filling gives each channel group its bits; groups
 
 ## News
 
+- **2026-11**: v0.3. **SPECTRA-Flash for Qwen3.5-9B** on vLLM 0.29: its attention KV cache 6.9× smaller at 99.6% of
+  dense on LongBench at 32K, and up to 4.4× (32K) and 6.2× (128K) decode throughput.
 - **2026-11**: v0.2. **SPECTRA-Flash**: a 7× smaller KV cache and faster decode than dense, on FlashMLA and vLLM 0.29,
   with converted params for Llama-3.1-8B-Instruct. SPECTRA gets the paper's operating points as presets, and LongBench
   runs the official prompts and scorer on the full test split.
@@ -42,14 +44,14 @@ activations. (b) Reverse water-filling gives each channel group its bits; groups
 
 ## What is in this repo
 
-| | KV cache | Decode speed vs dense | Setup |
-|---|---|---|---|
-| [**SPECTRA**](#spectra-1) | up to 11× smaller | slower: keys and values are rebuilt at every step | none: fitted in closed form in about 2 min, no training |
-| [**SPECTRA-Flash**](#spectra-flash) | 7× smaller | 1.0× at batch 1, up to 4.3× throughput | download the converted params (1.5 GB) |
+| | KV cache | Setup |
+|---|---|---|
+| [**SPECTRA**](#spectra-1) | up to 11× smaller | none: fitted in closed form in about 2 min, no training |
+| [**SPECTRA-Flash**](#spectra-flash) | about 7× smaller, faster decode than dense | download the converted params ([Llama-3.1-8B-Instruct, Qwen3.5-9B](#released-models)) |
 
 SPECTRA is the training-free, closed-form codec; its speed gain needs a new decode kernel and serving support.
-SPECTRA-Flash starts from the same fit, adds a light tuning step (2.6 GPU hours), and stores the latent in the layout
-that existing kernels read, so it is fast today.
+SPECTRA-Flash starts from the same fit, adds a light tuning step (under 3 GPU hours), and stores the latent in the
+layout that existing kernels read, so it is fast today.
 
 ## Installation
 
@@ -116,8 +118,6 @@ llm = spectra.vllm.LLM("NousResearch/Meta-Llama-3.1-8B-Instruct", "llama31_vllm7
                        gpu_memory_utilization=0.85, max_model_len=32768)
 ```
 
-These paths rebuild the keys and values in PyTorch at every step, so they save memory but decode slower than dense.
-
 ---
 
 ## SPECTRA-Flash
@@ -128,23 +128,28 @@ refined by block-wise distillation; the base model is frozen. At decode, attenti
 FlashMLA plus a small exact window (the first 4 and the latest 123 tokens), and merges the two in one softmax. Nothing
 is reconstructed.
 
-- **7× smaller KV cache.** At 32K tokens, one token takes 18.5 KiB instead of 128 KiB.
-- **Faster than dense at decode.** On one H100, a decode step is as fast as dense at batch 1 and 2.36× faster at
-  batch 16 (32K context). The freed memory holds 4× the batch, so the best throughput is 4.3× dense (4.5× at 128K).
-- **99.3% of dense accuracy** on LongBench-8 ([Results](#results)).
-- **The base model is not changed.** The release is a small delta: only the record maps (1.5 GB). The base weights
-  come from Meta.
+- **About 7× smaller KV cache.** On Llama-3.1-8B at 32K tokens, one token takes 18.5 KiB instead of 128 KiB. Qwen3.5-9B
+  keeps keys and values in only 8 of its 32 layers (the others are Gated DeltaNet layers with a fixed-size state);
+  there one token takes 4.6 KiB instead of 32 KiB.
+- **Faster than dense at decode.** Llama-3.1-8B, on one H100: a decode step is as fast as dense at batch 1 and 2.36×
+  faster at batch 16 (32K context); the freed memory holds 4× the batch, so the best throughput is 4.3× dense (4.5× at
+  128K). Qwen3.5-9B in vLLM: 4.4× dense decode throughput at 32K and 6.2× at 128K.
+- **99.3% (Llama) and 99.6% (Qwen3.5) of dense accuracy** on LongBench ([Results](#results)).
+- **The base model is not changed.** The release is a small delta: only the record maps (1.5 GB for Llama-3.1-8B,
+  0.11 GB for Qwen3.5-9B).
 
-### Released model
+### Released models
 
-| Model | Conversion | LongBench-8 (% of dense) |
-|---|---|---|
-| [Llama-3.1-8B-Instruct-SPECTRA-Flash](https://huggingface.co/morriszjm/Llama-3.1-8B-Instruct-SPECTRA-Flash) | closed-form init + block-wise distillation, 2.6 H100 GPU hours | 99.3 |
+| Model | Base model | Conversion | LongBench (% of dense) |
+|---|---|---|---|
+| [Llama-3.1-8B-Instruct-SPECTRA-Flash](https://huggingface.co/morriszjm/Llama-3.1-8B-Instruct-SPECTRA-Flash) | [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | closed-form init + block-wise distillation, 2.6 H100 GPU hours | 99.3 (LongBench-8) |
+| [Qwen3.5-9B-SPECTRA-Flash](https://huggingface.co/morriszjm/Qwen3.5-9B-SPECTRA-Flash) | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | closed-form init + block-wise distillation, 0.3 H100 GPU hours | 99.6 (Protocol-B, 32K) |
 
-The base model is [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) (accept
-its license on the Hub first). Built with Llama.
+For Llama, accept the base model's license on the Hub first. Built with Llama. Qwen3.5-9B runs on vLLM only.
 
 ### HuggingFace Transformers
+
+Llama-3.1-8B-Instruct:
 
 ```python
 import torch, spectra.flash
@@ -178,6 +183,18 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 32768 \
 
 Then query it with any OpenAI client. The default vLLM compilation settings work (torch.compile, CUDA graphs).
 
+**Qwen3.5.** The Qwen3.5 checkpoints are vision-language models: serve the language model with
+`--language-model-only`. `--block-size 540` lets the Flash pages tile vLLM's page for the Gated DeltaNet state (the
+value for Qwen3.5-9B), and the expandable-segments allocator keeps 128K-token prefills from fragmenting GPU memory.
+Only the 8 full-attention layers change; the Gated DeltaNet layers and their state run as in stock vLLM.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True vllm serve Qwen/Qwen3.5-9B --language-model-only \
+    --block-size 540 --max-model-len 131072 \
+    --no-enable-prefix-caching --no-enable-chunked-prefill --max-num-batched-tokens 131072 \
+    --hf-overrides '{"spectra_flash": "morriszjm/Qwen3.5-9B-SPECTRA-Flash"}'
+```
+
 **Use exact prefill.** With `--no-enable-chunked-prefill` and `--max-num-batched-tokens` at least the longest prompt,
 each prompt is prefilled in one step with exact attention, which is the evaluated setting. With chunked prefill
 (vLLM's default), a later chunk sees the earlier chunks only through the compressed record. It runs, but it is an
@@ -201,9 +218,25 @@ spectra-flash bench serve  --params $P
 spectra-flash convert --model $M --out spectra-flash-llama31-8b --gpus 0,1,2,3
 ```
 
-### Limits (v0.2)
+Qwen3.5-9B, speed in vLLM:
 
-- Llama-3.1-8B-Instruct; bfloat16; one GPU (vLLM tensor parallel size 1); Hopper GPUs.
+```bash
+P=morriszjm/Qwen3.5-9B-SPECTRA-Flash
+Q=Qwen/Qwen3.5-9B
+
+# decode throughput at a fixed batch, dense (GPU 0) and Flash (GPU 1), at 32K and 128K context
+spectra-flash bench vllm-decode --model $Q --params $P --ctx 32000 --batches 1,48 --flash-batches 1,48,128,256 --gpus 0,1
+spectra-flash bench vllm-decode --model $Q --params $P --ctx 131072 --batches 1,12 --flash-batches 1,12,48 --gpus 0,1
+
+# serving at one memory budget
+spectra-flash bench serve --model $Q --params $P --input-len 32000 --output-len 8192 --num-prompts 256 \
+    --max-num-seqs 512 --gpus 0,1
+```
+
+### Limits (v0.3)
+
+- Llama-3.1-8B-Instruct (🤗 Transformers and vLLM) and Qwen3.5-9B (vLLM only, text only); bfloat16; one GPU (vLLM
+  tensor parallel size 1); Hopper GPUs.
 - vLLM: no prefix caching, no speculative decoding, no KV connectors.
 - 🤗 Transformers: batches must be unpadded (batch size 1 or equal-length prompts).
 
@@ -255,18 +288,42 @@ everything a method stores, including scales and the tokens kept exact.
 SPECTRA-Flash runs in its decode engine (bf16, dense 53.80); SPECTRA in 🤗 Transformers (fp16, dense 53.29). Its 6.4×
 is lower than 7× because LongBench prompts are short (median 5.7K tokens), so the 127 exact tokens weigh more.
 
-**Speed**, Llama-3.1-8B-Instruct at 32K context, one H100 NVL, relative to dense:
+**SPECTRA-Flash speed**, Llama-3.1-8B-Instruct at 32K context, one H100 NVL, relative to dense:
 
 | | KV cache per token | Decode step, batch 1 | Max decode throughput | vLLM serving throughput |
 |---|---|---|---|---|
 | Dense | 128 KiB | 1.00× | 1.00× | 1.00× |
-| SPECTRA (~11×) | 10.7 KiB | — | 0.04× | — |
 | **SPECTRA-Flash** | **18.5 KiB** | **1.00×** | **4.3×** | **1.21–2.26×** |
 
-Max decode throughput: each method at the largest batch its cache fits. SPECTRA: its rebuild decode path in 🤗
-Transformers at the memory of the dense cache. SPECTRA-Flash: its decode engine with CUDA graphs, dense with
-FlashAttention-3. vLLM serving: all requests submitted at once at one memory budget, 32K prompts + 256 output tokens
-(1.21×) and 8K prompts + 2K output tokens (2.26×).
+Max decode throughput: each at the largest batch its cache fits; SPECTRA-Flash in its decode engine with CUDA graphs,
+dense with FlashAttention-3. vLLM serving: all requests submitted at once at one memory budget, 32K prompts + 256
+output tokens (1.21×) and 8K prompts + 2K output tokens (2.26×).
+
+**SPECTRA-Flash on Qwen3.5-9B.** Accuracy on LongBench Protocol-B at 32K (11 tasks, the 2,065 prompts of the 32K
+protocol with the Qwen3.5 tokenizer, greedy), as % of dense in the same harness:
+
+| Method | KV compression (attention layers) | % of dense | Lowest task |
+|---|---|---|---|
+| Dense (bf16) | 1× | 100 | 100 |
+| **SPECTRA-Flash** | **~6.9×** | **99.6** | 98.4 |
+
+Scored with the reference decode in 🤗 Transformers (exact prefill, the record's query in fp32). The vLLM plugin also
+rounds that query to fp8; it was checked against dense vLLM on a 28K-token needle and four LongBench prompts, not on
+the full set.
+
+Speed in vLLM 0.29, one H100 NVL, `gpu_memory_utilization` 0.9, dense = stock vLLM:
+
+| | Dense | SPECTRA-Flash | vs dense |
+|---|---|---|---|
+| Requests of 32K tokens the KV cache holds | 58 | 290 | 5.0× |
+| Decode step at batch 1, 32K / 128K context | 6.67 / 8.11 ms | 6.86 / 7.17 ms | 0.97× / 1.13× |
+| Decode throughput, 32K context | 1,315 tok/s (batch 48) | 5,730 tok/s (batch 256) | **4.4×** |
+| Decode throughput, 128K context | 308 tok/s (batch 12) | 1,915 tok/s (batch 48) | **6.2×** |
+
+Serving, all requests submitted at once at one memory budget, output throughput vs dense: 1.13× (256 × 32K prompts +
+256 output tokens), 1.65× (512 × 8K + 2K), 1.65× (96 × 128K + 2K) and 2.75× (256 × 32K + 8K). Dense Qwen3.5 already
+keeps keys and values in only 8 of 32 layers, so its cache holds many requests and prefill, which costs the same in
+both, takes a larger share; the gain grows with the share of decode.
 
 **Needle in a haystack**, contexts 1K–32K × 7 depths, % of cells retrieved (one needle / four needles):
 
@@ -314,6 +371,7 @@ python tests/check_roundtrip.py             # compress -> save -> load gives the
 python tests/test_flash_kernels.py          # Triton kernels vs PyTorch
 python tests/check_flash_engine.py --params morriszjm/Llama-3.1-8B-Instruct-SPECTRA-Flash   # needle, engine vs 🤗
 python tests/check_flash_short.py --params morriszjm/Llama-3.1-8B-Instruct-SPECTRA-Flash    # short prompts vs dense
+python tests/check_flash_qwen35.py --params morriszjm/Qwen3.5-9B-SPECTRA-Flash              # Qwen3.5 in vLLM vs dense
 ```
 
 ## TODO
@@ -321,7 +379,9 @@ python tests/check_flash_short.py --params morriszjm/Llama-3.1-8B-Instruct-SPECT
 - ✅ SPECTRA in 🤗 Transformers with the paper's presets; the paper's LongBench and NIAH protocols
 - ✅ Packed INT4 latent cache in 🤗 Transformers and vLLM 0.7
 - ✅ SPECTRA-Flash: conversion, 🤗 Transformers path, vLLM 0.29 plugin, converted Llama-3.1-8B-Instruct params
-- ⬜ SPECTRA-Flash for more models (Mistral, Qwen2.5)
+- ✅ SPECTRA-Flash for Qwen3.5-9B in vLLM 0.29, converted params
+- ⬜ SPECTRA-Flash for Qwen3.5: conversion script, 🤗 Transformers path, LongBench through the vLLM plugin
+- ⬜ SPECTRA-Flash for more models
 - ⬜ A SPECTRA decode kernel that attends on the latent without rebuilding the keys and values
 - ⬜ PyPI package
 
@@ -342,8 +402,10 @@ python tests/check_flash_short.py --params morriszjm/Llama-3.1-8B-Instruct-SPECT
 ## License
 
 SPECTRA is released under the [MIT](LICENSE) license. `spectra/eval/metrics.py` and `spectra/eval/config/` are copied
-from [THUDM/LongBench](https://github.com/THUDM/LongBench) (MIT). The SPECTRA-Flash params are derived from Llama 3.1
-and are distributed under the [Llama 3.1 Community License](https://www.llama.com/llama3_1/license/).
+from [THUDM/LongBench](https://github.com/THUDM/LongBench) (MIT). The SPECTRA-Flash params for Llama-3.1-8B-Instruct
+are derived from Llama 3.1 and are distributed under the [Llama 3.1 Community License](https://www.llama.com/llama3_1/license/);
+the params for Qwen3.5-9B are derived from Qwen3.5-9B and are distributed under its
+[Apache License 2.0](https://huggingface.co/Qwen/Qwen3.5-9B/blob/main/LICENSE).
 
 ## Acknowledgements
 

@@ -3,6 +3,7 @@
   spectra-flash convert ...   convert a base model (python -m spectra.flash.convert)
   spectra-flash bench decode  end-to-end decode speed: needle gate, then step time over context x batch x variant
   spectra-flash bench serve   vLLM serving throughput, dense vs Flash at one GPU memory budget
+  spectra-flash bench vllm-decode   vLLM steady-state decode throughput at a fixed batch and context (Qwen3.5 too)
 LongBench: python scripts/run_longbench.py --flash <params> (see README).
 """
 from __future__ import annotations
@@ -87,8 +88,11 @@ def main(argv=None):
         if rest[:1] == ["serve"]:
             from .bench_serve import main as serve_main
             return serve_main(rest[1:])
-        print("usage: spectra-flash bench decode|serve [--help]   (end-to-end decode step time | vLLM serving "
-              "throughput at one memory budget)")
+        if rest[:1] == ["vllm-decode"]:
+            from .bench_vllm_decode import main as vd_main
+            return vd_main(rest[1:])
+        print("usage: spectra-flash bench decode|serve|vllm-decode [--help]   (engine decode step time | vLLM serving "
+              "throughput at one memory budget | vLLM decode throughput at a fixed batch)")
         return 2
     if cmd == "convert":
         from .convert import main as m
